@@ -576,13 +576,19 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             freeze_vision_encoder=config.freeze_vision_encoder,
             train_expert_only=config.train_expert_only,
         )
-
-        self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
-        self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
+        
+        ##########
+        if not config.classifier_mode: # claffifier not active
+            self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
+            self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
+            self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
+            self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+        else:
+            self.classifier_head = nn.Linear(action_expert_config.width, config.num_subskill_classes)
+        ##########
 
         self.state_proj = nn.Linear(config.max_state_dim, action_expert_config.width)
-        self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
-        self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+        
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -685,7 +691,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
+    def embed_suffix(self, state, noisy_actions=None, timestep=None): ##########
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
@@ -706,40 +712,43 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         pad_masks.append(state_mask)
         att_masks += [1]
 
-        # Embed timestep using sine-cosine positional encoding
-        time_emb = create_sinusoidal_pos_embedding(
-            timestep,
-            self.action_in_proj.out_features,
-            min_period=self.config.min_period,
-            max_period=self.config.max_period,
-            device=timestep.device,
-        )
-        time_emb = time_emb.type(dtype=timestep.dtype)
-
-        # Fuse timestep + action information using an MLP
-        def action_proj_func(noisy_actions):
-            return self.action_in_proj(noisy_actions)
-
-        action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
-
-        time_emb = time_emb[:, None, :].expand_as(action_emb)
-        action_time_emb = torch.cat([action_emb, time_emb], dim=2)
-
-        def mlp_func(action_time_emb):
-            x = self.action_time_mlp_in(action_time_emb)
-            x = F.silu(x)
-            return self.action_time_mlp_out(x)
-
-        action_time_emb = self._apply_checkpoint(mlp_func, action_time_emb)
+        ##########
         adarms_cond = None
+        if not self.config.classifier_mode:
+            # Embed timestep using sine-cosine positional encoding
+            time_emb = create_sinusoidal_pos_embedding(
+                timestep,
+                self.action_in_proj.out_features,
+                min_period=self.config.min_period,
+                max_period=self.config.max_period,
+                device=timestep.device,
+            )
+            time_emb = time_emb.type(dtype=timestep.dtype)
 
-        embs.append(action_time_emb)
-        bsize, action_time_dim = action_time_emb.shape[:2]
-        action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
-        pad_masks.append(action_time_mask)
+            # Fuse timestep + action information using an MLP
+            def action_proj_func(noisy_actions):
+                return self.action_in_proj(noisy_actions)
 
-        # Set attention masks so that image, language and state inputs do not attend to action tokens
-        att_masks += [1] + ([0] * (self.config.chunk_size - 1))
+            action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
+
+            time_emb = time_emb[:, None, :].expand_as(action_emb)
+            action_time_emb = torch.cat([action_emb, time_emb], dim=2)
+
+            def mlp_func(action_time_emb):
+                x = self.action_time_mlp_in(action_time_emb)
+                x = F.silu(x)
+                return self.action_time_mlp_out(x)
+
+            action_time_emb = self._apply_checkpoint(mlp_func, action_time_emb)
+            # adarms_cond = None # portato fuori
+
+            embs.append(action_time_emb)
+            bsize, action_time_dim = action_time_emb.shape[:2]
+            action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
+            pad_masks.append(action_time_mask)
+
+            # Set attention masks so that image, language and state inputs do not attend to action tokens
+            att_masks += [1] + ([0] * (self.config.chunk_size - 1))
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -752,21 +761,32 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
     ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
-        if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
 
-        if time is None:
-            time = self.sample_time(actions.shape[0], actions.device)
+        ##########
+        if not self.config.classifier_mode: # self??
+            if noise is None:
+                noise = self.sample_noise(actions.shape, actions.device)
 
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+            if time is None:
+                time = self.sample_time(actions.shape[0], actions.device)
+
+            time_expanded = time[:, None, None]
+            x_t = time_expanded * noise + (1 - time_expanded) * actions
+            u_t = noise - actions
+        ##########
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
 
+        ##########
+        #suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        if self.config.classifier_mode:
+            suffix_embs = self.embed_suffix(state, None, None)
+        else:
+            suffix_embs = self.embed_suffix(state, x_t, time)
+        ##########
+        
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -797,15 +817,25 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
-        suffix_out = suffix_out[:, -self.config.chunk_size :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        ##########
+        if self.config.classifier_mode:
+            # classification
+            state_feat = suffix_out[:, 0, :]   # [B, D]
+            logits = self.classifier_head(state_feat)
 
-        def action_out_proj_func(suffix_out):
-            return self.action_out_proj(suffix_out)
+            return logits
 
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        else:
+            suffix_out = suffix_out[:, -self.config.chunk_size :]
+            suffix_out = suffix_out.to(dtype=torch.float32)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+            def action_out_proj_func(suffix_out):
+                return self.action_out_proj(suffix_out)
+
+            v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+
+            return F.mse_loss(u_t, v_t, reduction="none")
+        ##########
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -1290,8 +1320,20 @@ class PI0Policy(PreTrainedPolicy):
         images, img_masks = self._preprocess_images(batch)
         lang_tokens, lang_masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         state = self.prepare_state(batch)
-        actions = self.prepare_action(batch)
 
+        ##########
+        if self.config.classifier_mode:
+            logits = self.model.forward(
+                images, img_masks, lang_tokens, lang_masks, state,
+                actions=None   # non usate in classifier_mode
+            )
+            # logits: [B, num_subskill_classes]
+            # la loss la calcoli fuori nel training loop con CrossEntropyLoss
+            return logits, {}
+        ##########
+        
+        actions = self.prepare_action(batch)
+    
         # Compute loss
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions)
 
