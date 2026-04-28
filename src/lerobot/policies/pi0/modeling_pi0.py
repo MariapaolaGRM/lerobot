@@ -584,7 +584,17 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
         else:
-            self.classifier_head = nn.Linear(action_expert_config.width, config.num_subskill_classes)
+            # self.classifier_head = nn.Linear(
+            #     paligemma_config.width + action_expert_config.width,  # 2048 + 1024 = 3072
+            #     config.num_subskill_classes                           # 34
+            # )
+            self.classifier_head = nn.Sequential(
+                nn.LayerNorm(3072),
+                nn.Linear(3072, 1024),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(1024, config.num_subskill_classes)
+            )
         ##########
 
         self.state_proj = nn.Linear(config.max_state_dim, action_expert_config.width)
@@ -782,9 +792,9 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         ##########
         #suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if self.config.classifier_mode:
-            suffix_embs = self.embed_suffix(state, None, None)
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, None, None)
         else:
-            suffix_embs = self.embed_suffix(state, x_t, time)
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         ##########
         
         if (
@@ -803,7 +813,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            (prefix_out, suffix_out), _ = self.paligemma_with_expert.forward( ##########
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -811,17 +821,24 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
             )
-            return suffix_out
+            return prefix_out, suffix_out ##########
 
-        suffix_out = self._apply_checkpoint(
+        #suffix_out = self._apply_checkpoint(
+        #    forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        #)
+        result = self._apply_checkpoint(
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
+        prefix_out, suffix_out = result   # unpacking
 
         ##########
         if self.config.classifier_mode:
             # classification
             state_feat = suffix_out[:, 0, :]   # [B, D]
-            logits = self.classifier_head(state_feat)
+            #logits = self.classifier_head(state_feat)
+            vlm_feat = prefix_out.mean(dim=1)                         # [B, 2048]
+            x = torch.cat([vlm_feat, state_feat], dim=-1)             # [B, 3072]
+            logits = self.classifier_head(x)  
 
             return logits
 
