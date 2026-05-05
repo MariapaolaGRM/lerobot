@@ -334,8 +334,33 @@ def get_gemma_config(variant: str) -> GemmaConfig:  # see openpi `gemma.py: get_
         )
     else:
         raise ValueError(f"Unknown variant: {variant}")
+    
+###############
+class AttentionPooling(nn.Module): 
+    def __init__(self, dim):
+        super().__init__()
 
+        self.query = nn.Parameter(torch.randn(1, 1, dim))
+        self.scale = dim ** -0.5 # score normalization
 
+    def forward(self, x, pad_mask=None):
+        # x: [B, T, D]
+        # pad_mask: [B, T] bool, True = token reale
+        q = self.query.expand(x.shape[0], -1, -1)  # [B, 1, D]
+        scores = torch.bmm(q, x.transpose(1, 2)) * self.scale  # [B, 1, T]
+
+        if pad_mask is not None:
+            # azzera i token di padding prima del softmax
+            scores = scores.masked_fill(
+                ~pad_mask.unsqueeze(1),  # [B, 1, T]
+                float('-inf')
+            )
+
+        weights = torch.softmax(scores, dim=-1)  # [B, 1, T]
+        out = torch.bmm(weights, x)              # [B, 1, D]
+        return out.squeeze(1)                    # [B, D]
+###############
+#        
 class PaliGemmaWithExpertModel(
     nn.Module
 ):  # see openpi `gemma_pytorch.py: PaliGemmaWithExpertModel` this class is almost a exact copy of PaliGemmaWithExpertModel in openpi
@@ -578,7 +603,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
         
         ##########
-        if not config.classifier_mode: # claffifier not active
+        if not self.config.classifier_mode: # claffifier not active
             self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
             self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
@@ -588,13 +613,34 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             #     paligemma_config.width + action_expert_config.width,  # 2048 + 1024 = 3072
             #     config.num_subskill_classes                           # 34
             # )
-            self.classifier_head = nn.Sequential(
+
+            self.classifier_head = nn.Sequential(  
                 nn.LayerNorm(3072),
                 nn.Linear(3072, 1024),
-                nn.GELU(),
-                nn.Dropout(0.1),
-                nn.Linear(1024, config.num_subskill_classes)
+                nn.ReLU(),
+                nn.Linear(1024, config.num_subskill_classes),  
             )
+            
+            # Alternativa con un layer in più
+            # self.classifier_head = nn.Sequential(
+            #     nn.LayerNorm(3072),
+            #     nn.Linear(3072, 1024),
+            #     nn.ReLU(),
+            #     nn.Linear(1024, 512),
+            #     nn.ReLU(),
+            #     nn.Linear(512, config.num_subskill_classes),
+            # )
+
+            # fusion_dim = paligemma_config.width + action_expert_config.width
+            # self.classifier_head = nn.Sequential(
+            #     nn.LayerNorm(fusion_dim),
+            #     nn.Linear(fusion_dim, 1024),
+            #     nn.GELU(),
+            #     nn.Dropout(0.1),
+            #     nn.Linear(1024, config.num_subskill_classes),
+            # )
+        
+        self.attn_pool = AttentionPooling(dim=2048)
         ##########
 
         self.state_proj = nn.Linear(config.max_state_dim, action_expert_config.width)
@@ -766,14 +812,14 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
         return embs, pad_masks, att_masks, adarms_cond
-
+    
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state, actions, noise=None, time=None
+        self, images, img_masks, lang_tokens, lang_masks, state, actions=None, noise=None, time=None, labels=None
     ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
 
         ##########
-        if not self.config.classifier_mode: # self??
+        if not self.config.classifier_mode: 
             if noise is None:
                 noise = self.sample_noise(actions.shape, actions.device)
 
@@ -834,14 +880,17 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         ##########
         if self.config.classifier_mode:
             # classification
-            state_feat = suffix_out[:, 0, :]   # [B, D]
-            #logits = self.classifier_head(state_feat)
-            vlm_feat = prefix_out.mean(dim=1)                         # [B, 2048]
+            state_feat = suffix_out[:, 0, :]   # [B, 1024]
+
+            vlm_feat = self.attn_pool(prefix_out, pad_mask=prefix_pad_masks)  # [B, 2048]
+            # vlm_feat = prefix_out.mean(dim=1)                         # [B, 2048]
             x = torch.cat([vlm_feat, state_feat], dim=-1)             # [B, 3072]
             logits = self.classifier_head(x)  
-
-            return logits
-
+            
+            if labels is None:
+                return logits
+            loss = F.cross_entropy(logits, labels.long())
+            return loss
         else:
             suffix_out = suffix_out[:, -self.config.chunk_size :]
             suffix_out = suffix_out.to(dtype=torch.float32)
@@ -1340,20 +1389,21 @@ class PI0Policy(PreTrainedPolicy):
 
         ##########
         if self.config.classifier_mode:
-            logits = self.model.forward(
+            labels = batch["skill_label"]  # [B] DA DEFINIRE MEGLIO
+
+            loss = self.model.forward(
                 images, img_masks, lang_tokens, lang_masks, state,
-                actions=None   # non usate in classifier_mode
+                actions=None,
+                labels=labels,
             )
-            # logits: [B, num_subskill_classes]
-            # la loss la calcoli fuori nel training loop con CrossEntropyLoss
-            return logits, {}
+            loss_dict = {"loss": loss.item()}
+            return loss, loss_dict
         ##########
-        
+
         actions = self.prepare_action(batch)
-    
         # Compute loss
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions)
-
+        
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
