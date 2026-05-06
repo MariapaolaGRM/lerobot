@@ -87,6 +87,7 @@ class PI0Config(PreTrainedConfig):
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
 
     classifier_mode: bool = False  # Disable actions, use VLM+state for classification
+    num_subskill_classes: int = 34  # For classifier MLP
     
     # Optimizer settings: see openpi `AdamW``
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
