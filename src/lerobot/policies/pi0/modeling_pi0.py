@@ -640,7 +640,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             #     nn.Linear(1024, config.num_subskill_classes),
             # )
         
-        self.attn_pool = AttentionPooling(dim=2048)
+        self.attn_pool = AttentionPooling(dim=2048) 
         ##########
 
         self.state_proj = nn.Linear(config.max_state_dim, action_expert_config.width)
@@ -888,9 +888,10 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             logits = self.classifier_head(x)  
             
             if labels is None:
-                return logits
+                return logits, None
+            
             loss = F.cross_entropy(logits, labels.long())
-            return loss
+            return logits, loss
         else:
             suffix_out = suffix_out[:, -self.config.chunk_size :]
             suffix_out = suffix_out.to(dtype=torch.float32)
@@ -1389,15 +1390,15 @@ class PI0Policy(PreTrainedPolicy):
 
         ##########
         if self.config.classifier_mode:
-            labels = batch["skill_label"]  # [B] DA DEFINIRE MEGLIO
+            labels = batch["skill_label"]  # [B]
 
-            loss = self.model.forward(
+            logits, loss = self.model.forward(
                 images, img_masks, lang_tokens, lang_masks, state,
                 actions=None,
                 labels=labels,
             )
             loss_dict = {"loss": loss.item()}
-            return loss, loss_dict
+            return logits, loss, loss_dict
         ##########
 
         actions = self.prepare_action(batch)
