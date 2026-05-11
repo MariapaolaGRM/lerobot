@@ -32,7 +32,9 @@ from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.logging_utils import AverageMeter
 from lerobot.utils.random_utils import set_seed
-from lerobot.utils.train_utils import (
+
+#from lerobot.utils.train_utils import (
+from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
     load_training_state,
     save_checkpoint,
@@ -56,16 +58,16 @@ logging.basicConfig(
 
 SKILL_REGISTRY: dict[int, tuple[int, str]] = {
     # skill_id: (class_index, name)
-    1:  (0, "navigate to"),
-    2:  (1, "pick up from"),
-    3:  (2, "place on"),
-    4:  (3, "place in"),
-    5:  (4, "open"),
-    6:  (5, "close"),
-    7:  (6, "toggle on"),
+    1: (0, "move to"),  # 73,882 frame
+    2: (1, "pick up from"),  # 66,453 frame
+    4: (2, "place in"),  # 26,634 frame
+    10: (3, "open door"),  # 10,582 frame
+    3: (4, "place on"),  # 8,291 frame
+    12: (5, "close door"),  # 7,541 frame
+    67: (6, "press"),  # 2,919 frame
     8:  (7, "toggle off"),
     90: (8, "push to"),
-    # add more skills after running analyze_skill.py
+    
 }
 
 SKILL_ID_TO_CLASS   = {sid: cls  for sid, (cls, _)   in SKILL_REGISTRY.items()}
