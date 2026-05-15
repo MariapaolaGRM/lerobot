@@ -27,17 +27,16 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ═════════════════════════════════════════════════════════════════════════════
 SKILL_REGISTRY: dict[int, tuple[int, str]] = {
     # skill_id: (class_index, name)
-    1: (0, "move to"),  # 73,882 frame
-    2: (1, "pick up from"),  # 66,453 frame
-    4: (2, "place in"),  # 26,634 frame
-    #10: (3, "open door"),  # 10,582 frame
-    3: (4, "place on"),  # 8,291 frame
-    12: (5, "close door"),  # 7,541 frame
-    67: (6, "press"),  # 2,919 frame
-    8:  (7, "toggle off"),
-    90: (8, "push to"),
+    1: (0, "move to"),  # 1,770,229 frame
+    2: (1, "pick up from"),  # 1,121,218 frame
+    4: (2, "place in"),  # 582,636 frame
+    10: (3, "open door"),  # 238,308 frame
+    3: (4, "place on"),  # 154,266 frame
+    12: (5, "close door"),  # 129,016 frame
+    67: (6, "press"),  # 58,120 frame
+    90: (7, "push to"),  # 615 frame
 
-    9: (3, "push"),
+    #9: (3, "push"),
     
 }
 
@@ -100,26 +99,29 @@ def test_load_skill_annotation_real(annotations_root: Path):
 
 
 test_load_skill_annotation_real(
-    Path("/home/mariapaolagerminario/Documents/behavior_subset/annotations")
+    Path("/home/mariapaolagerminario/Documents/Test/behavior_subset_copy/annotations")
 )
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PROVA
-# per il funzionamento della funzione SkillLabeledDataset (non fattibile 
-# perchè dataset in formato v2.1 ma attuale formato lerobot dataset v3.0)
 
-# raw_dataset = LeRobotDataset(
-#     repo_id="behavior-1k/2025-challenge-demos",
-#     root=Path("/home/mariapaolagerminario/Documents/behavior_subset"),
-# )
+raw_dataset = LeRobotDataset(
+    repo_id="behavior_subset",
+    root=Path("/home/mariapaolagerminario/Documents/Test/behavior_subset_copy"),
 
-# annotations_root = Path("/home/mariapaolagerminario/Documents/behavior_subset/annotations")
+    revision="main",
+    force_cache_sync=False,
+)
 
-# dataset_keep_all = SkillLabeledDataset(
-#     raw_dataset,
-#     annotations_root,
-#     ignore_unlabeled=False,
-# )
+annotations_root = Path("/home/mariapaolagerminario/Documents/Test/behavior_subset_copy/annotations")
+
+dataset_keep_all = SkillLabeledDataset(
+    raw_dataset,
+    annotations_root,
+    ignore_unlabeled=False,
+)
+
+sample = dataset_keep_all[0]
 
 # dataset_filtered = SkillLabeledDataset(
 #     raw_dataset,
@@ -127,31 +129,30 @@ test_load_skill_annotation_real(
 #     ignore_unlabeled=True,
 # )
 
-# print("raw dataset:", len(raw_dataset))
-# print("keep all:", len(dataset_keep_all))
+print("raw dataset:", len(raw_dataset))
+print("keep all:", len(dataset_keep_all))
 # print("filtered:", len(dataset_filtered))
 # print("rimossi:", len(dataset_keep_all) - len(dataset_filtered))
 
-# print("\n=== primi sample ignorati nel dataset keep_all ===")
-# found = 0
+found = 0
 
-# for i in range(len(dataset_keep_all)):
-#     sample = dataset_keep_all[i]
-#     label = sample["skill_label"].item()
+for i in range(len(dataset_keep_all)):
+    sample = dataset_keep_all[i]
+    label = sample["skill_label"].item()
 
-#     if label == IGNORE_LABEL:
-#         print(
-#             "idx:", i,
-#             "episode:", int(sample["episode_index"]),
-#             "frame:", int(sample["frame_index"]),
-#             "label:", label,
-#         )
-#         found += 1
+    if label == IGNORE_LABEL:
+        print(
+            "idx:", i,
+            "episode:", int(sample["episode_index"]),
+            "frame:", int(sample["frame_index"]),
+            "label:", label,
+        )
+        found += 1
 
-#         if found >= 20:
-#             break
+        if found >= 20: # mostra solo primi 20
+            break
 
-# print("ignorati mostrati:", found)
+print("ignorati mostrati:", found)
 # ═════════════════════════════════════════════════════════════════════════════
 class AttentionPooling(nn.Module):
     def __init__(self, dim):
