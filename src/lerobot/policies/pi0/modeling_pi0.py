@@ -609,27 +609,22 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
         else:
-            # self.classifier_head = nn.Linear(
-            #     paligemma_config.width + action_expert_config.width,  # 2048 + 1024 = 3072
-            #     config.num_subskill_classes                           # 34
-            # )
-
-            self.classifier_head = nn.Sequential(  
-                nn.LayerNorm(3072),
-                nn.Linear(3072, 1024),
-                nn.ReLU(),
-                nn.Linear(1024, config.num_subskill_classes),  
-            )
-            
-            # Alternativa con un layer in più
-            # self.classifier_head = nn.Sequential(
+            # self.classifier_head = nn.Sequential(  
             #     nn.LayerNorm(3072),
             #     nn.Linear(3072, 1024),
             #     nn.ReLU(),
-            #     nn.Linear(1024, 512),
-            #     nn.ReLU(),
-            #     nn.Linear(512, config.num_subskill_classes),
+            #     nn.Linear(1024, config.num_subskill_classes),  
             # )
+            
+            # Alternativa con un layer in più
+            self.classifier_head = nn.Sequential(
+                nn.LayerNorm(3072),
+                nn.Linear(3072, 1024),
+                nn.ReLU(),
+                nn.Linear(1024, 512),
+                nn.ReLU(),
+                nn.Linear(512, config.num_subskill_classes),
+            )
 
             # fusion_dim = paligemma_config.width + action_expert_config.width
             # self.classifier_head = nn.Sequential(
