@@ -97,6 +97,24 @@ class Pi0NewLineProcessor(ComplementaryDataProcessorStep):
         """
         return features
 
+class PreserveExtraKeysWrapper:
+    def __init__(self, processor):
+        self.processor = processor
+
+    def __call__(self, batch):
+        # Salva una copia di tutte le chiavi originali
+        original = dict(batch)
+
+        # Processa (il processor può eliminare o aggiungere chiavi)
+        processed = self.processor(batch)
+
+        # Reinserisci le chiavi originali che il processor ha eliminato
+        for k, v in original.items():
+            if k not in processed:
+                processed[k] = v
+
+        return processed
+    
 
 def make_pi0_pre_post_processors(
     config: PI0Config,
@@ -164,11 +182,20 @@ def make_pi0_pre_post_processors(
         DeviceProcessorStep(device="cpu"),
     ]
 
+    preprocessor = PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
+        steps=input_steps,
+        name=POLICY_PREPROCESSOR_DEFAULT_NAME,
+    )
+
+    #known_keys = set(config.input_features) | set(config.output_features) | {"task"}
+
+    preprocessor = PreserveExtraKeysWrapper(
+        preprocessor,
+        #keep_keys=known_keys,
+    )
+    
     return (
-        PolicyProcessorPipeline[dict[str, Any], dict[str, Any]](
-            steps=input_steps,
-            name=POLICY_PREPROCESSOR_DEFAULT_NAME,
-        ),
+        preprocessor,
         PolicyProcessorPipeline[PolicyAction, PolicyAction](
             steps=output_steps,
             name=POLICY_POSTPROCESSOR_DEFAULT_NAME,

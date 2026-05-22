@@ -14,12 +14,13 @@ Usage:
         --config_path=/home/mariapaolagerminario/venvs/lerobot/training_config/config.yaml
 """
 
-#from __future__ import annotations
-
 import os
 os.environ["LEROBOT_VIDEO_TIMESTAMP_TOLERANCE_S"] = "0.1"  # 10x la default
 
 #import importlib
+#from __future__ import annotations
+#from pprint import pformat
+#from lerobot.utils.import_utils import register_third_party_plugins
 
 import argparse
 import json
@@ -27,7 +28,6 @@ import logging
 import time
 from contextlib import nullcontext
 from pathlib import Path
-#from pprint import pformat
 from typing import Any
 
 import numpy as np
@@ -57,7 +57,8 @@ import lerobot
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi0.modeling_pi0 import PI0Policy
 
-#from lerobot.utils.import_utils import register_third_party_plugins
+# from lerobot.policies import make_pre_post_processors # PREPROCESSOR
+from lerobot.policies.pi0.processor_pi0 import make_pi0_pre_post_processors
 
 import lerobot.datasets.video_utils as _vu
 _original_decode = _vu.decode_video_frames_torchcodec
@@ -88,12 +89,11 @@ log = logging.getLogger(__name__)
 #     eval_num_batches: int | None = None
 
 
+# EVENTUALE ALTERNATIVA DI PREPROCESSING
 # from transformers import AutoTokenizer
-
 # _TOKENIZER = None
 # _TOKENIZER_NAME = "google/paligemma-3b-pt-224"
 # _TOKENIZER_MAX_LENGTH = 48
-
 
 # def get_tokenizer():
 #     global _TOKENIZER
@@ -133,26 +133,21 @@ def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[st
         k: v.to(device) if isinstance(v, torch.Tensor) else v
         for k, v in batch.items()
     }
-
-    # tronca lo stato ai primi 28 valori
-    if "observation.state" in batch:
-        batch["observation.state"] = batch["observation.state"][:, :28]
-
  
     # PI0 legge sempre i token di linguaggio dal batch prima del check
     # classifier_mode — se non ci sono li aggiungo vuoti (sequenza di zeri).
     # tokenizer_max_length default = 48 (da PI0Config).
-    if "observation.language.tokens" not in batch:
-        B = next(v.shape[0] for v in batch.values() if isinstance(v, torch.Tensor))
-        T = 48  # tokenizer_max_length default
-        batch["observation.language.tokens"] = torch.zeros(
-            B, T, dtype=torch.long, device=device
-        )
-        batch["observation.language.attention_mask"] = torch.zeros(
-            B, T, dtype=torch.bool, device=device
-        )
+    # if "observation.language.tokens" not in batch:
+    #     B = next(v.shape[0] for v in batch.values() if isinstance(v, torch.Tensor))
+    #     T = 48  # tokenizer_max_length default
+    #     batch["observation.language.tokens"] = torch.zeros(
+    #         B, T, dtype=torch.long, device=device
+    #     )
+    #     batch["observation.language.attention_mask"] = torch.zeros(
+    #         B, T, dtype=torch.bool, device=device
+    #     )
     
-
+    # EVENTUALE ALTERNATIVA DI PREPROCESSING
     # if "observation.language.tokens" not in batch:
     #     tokenizer = get_tokenizer()
     #     tasks = batch.get("task", None)
@@ -290,7 +285,7 @@ class SkillLabeledDataset(Dataset):
                         f"using {matches[0]}"
                     )
                 else:
-                    logging.info(
+                    logging.debug(
                         f"[ANNOTATIONS] episode {episode_index} -> {matches[0].name}"
                     )
                 self._label_cache[episode_index] = load_skill_annotation(matches[0])
@@ -313,7 +308,11 @@ class SkillLabeledDataset(Dataset):
         else:
             skill_label = int(labels[frame_idx])
 
-        sample["skill_label"] = torch.tensor(skill_label, dtype=torch.long)
+        sample["skill_label"] = torch.tensor(skill_label, dtype=torch.long) # aggiunge skill
+
+        if idx == 0:
+            print("Debug sample.keys: ", sample.keys()) 
+
         return sample
 
 
@@ -417,6 +416,7 @@ def training_step(
     optimizer: torch.optim.Optimizer,
     grad_clip_norm: float,
     device: torch.device,
+    preprocessor, # PREPROCESSOR
     use_amp: bool = False,
     scaler: torch.cuda.amp.GradScaler | None = None,
 ) -> dict[str, float]:
@@ -424,8 +424,24 @@ def training_step(
     policy.train()
     
     batch = move_batch_to_device(batch, device)
-    
+
+    # Salva skill_label prima che il preprocessor la rimuova
+    #labels = batch.pop("skill_label")
+
+    #print("Primo: ",batch)
+
     labels = batch["skill_label"]
+
+    # PREPROCESSOR
+    batch = preprocessor(batch)
+
+    # tronca lo stato ai primi 28 valori
+    batch["observation.state"] = batch["observation.state"][:, :28]
+    #print("Secondo: ",batch)
+
+    # Reinierisci skill_label nel batch preprocessato
+    #batch["skill_label"] = labels
+    #print("Terzo: ",batch)
 
     ctx = (
         torch.autocast(device_type=device.type, dtype=torch.bfloat16)
@@ -477,6 +493,7 @@ def validate(
     policy: PI0Policy,
     val_loader: DataLoader,
     device: torch.device,
+    preprocessor, # PREPROCESSOR
     num_batches: int | None = None,
 ) -> dict[str, float]:
     """Validation loop on val_loader."""
@@ -492,7 +509,19 @@ def validate(
             break
 
         batch = move_batch_to_device(batch, device)
+
         labels = batch["skill_label"]
+        batch = preprocessor(batch) # PREPROCESSOR
+
+        # tronca lo stato ai primi 28 valori
+        batch["observation.state"] = batch["observation.state"][:, :28]
+
+        # Salva skill_label prima che il preprocessor la rimuova
+        # labels = batch.pop("skill_label")
+        # # PREPROCESSOR
+        # batch = preprocessor(batch)
+        # # Reinierisci skill_label nel batch preprocessato
+        # batch["skill_label"] = labels
 
         output = policy.forward(batch)
         logits, loss, _ = unpack_policy_output(output)
@@ -530,6 +559,7 @@ def test(
     policy: PI0Policy,
     test_loader: DataLoader,
     device: torch.device,
+    preprocessor, # PREPROCESSOR
 ) -> dict[str, float]:
     """Final evaluation on the test set (use only once, at the end)."""
     logging.info("\n==============================")
@@ -540,6 +570,7 @@ def test(
         policy=policy,
         val_loader=test_loader,
         device=device,
+        preprocessor=preprocessor, # PREPROCESSOR
         num_batches=None, # num_batches=cfg.eval_num_batches # DA PROVARE
     ) 
 
@@ -590,7 +621,7 @@ def train(cfg, mode: str = "train_val") -> None:
     dataset_root = Path(cfg.dataset.root).expanduser().resolve()
     annotations_root = dataset_root / "annotations"
 
-    import json
+    # import json
     info = json.load(open(dataset_root / "meta" / "info.json"))
     num_episodes = info["total_episodes"]
 
@@ -681,6 +712,11 @@ def train(cfg, mode: str = "train_val") -> None:
             #shape = tuple(feat["shape"])
             input_features[key] = PolicyFeature(type=FeatureType.STATE, shape=(28,))
 
+    # input_features["task"] = PolicyFeature( # PREPROCESSOR
+    #     type=FeatureType.TEXT,
+    #     shape=(1,),
+    # )
+
     output_features: dict = {}
     if "action" in features_meta:
         shape = tuple(features_meta["action"]["shape"])
@@ -719,6 +755,23 @@ def train(cfg, mode: str = "train_val") -> None:
         torch_dtype=torch.bfloat16,
         #torch_dtype=torch.float16, # pesi caricati in fp16 
     ).to(device)
+
+    # PREPROCESSOR
+    # processor_kwargs = {
+    #     "dataset_stats": train_raw.meta.stats,
+    # }
+    # postprocessor_kwargs = {}
+    # preprocessor, postprocessor = make_pre_post_processors(
+    #     policy_cfg=policy_cfg,
+    #     pretrained_path=cfg.policy.pretrained_path,
+    #     **processor_kwargs,
+    #     **postprocessor_kwargs,
+    # )
+
+    preprocessor, postprocessor = make_pi0_pre_post_processors(
+        config=policy_cfg,
+        dataset_stats=train_raw.meta.stats,
+    )
 
     allocated = torch.cuda.memory_allocated() / 1e9
     reserved  = torch.cuda.memory_reserved() / 1e9
@@ -796,6 +849,7 @@ def train(cfg, mode: str = "train_val") -> None:
             optimizer=optimizer,
             grad_clip_norm=cfg.optimizer.grad_clip_norm if cfg.optimizer else 10.0, #cfg.training.grad_clip_norm,
             device=device,
+            preprocessor=preprocessor, # PREPROCESSOR
             use_amp=use_amp,
             scaler=scaler,
         )
@@ -846,6 +900,7 @@ def train(cfg, mode: str = "train_val") -> None:
                 policy=policy,
                 val_loader=val_loader,
                 device=device,
+                preprocessor=preprocessor,
                 num_batches=None, #getattr(cfg.training, "eval_num_batches", None),
             )
             val_summary = " | ".join(f"{k}={v:.4f}" for k, v in val_metrics.items())
@@ -898,7 +953,7 @@ def train(cfg, mode: str = "train_val") -> None:
     # ── Final validation (skipped in 'train' mode) ───────────────────────
     if mode in ("train_val", "train_val_test"):
         logging.info("Running final full validation...")
-        final_val = validate(policy, val_loader, device, num_batches=None)
+        final_val = validate(policy, val_loader, device, preprocessor=preprocessor, num_batches=None)
         logging.info("Final validation results:")
         for k, v in final_val.items():
             logging.info(f"  {k}: {v:.4f}")
@@ -934,7 +989,7 @@ def train(cfg, mode: str = "train_val") -> None:
             num_workers=cfg.num_workers,
             pin_memory=device.type == "cuda",
         )
-        final_test = test(policy, test_loader, device)
+        final_test = test(policy, test_loader, device, preprocessor=preprocessor)
         logging.info("Final TEST results:")
         for k, v in final_test.items():
             logging.info(f"  {k}: {v:.4f}")
