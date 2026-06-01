@@ -80,7 +80,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-#DA PROVARE
+# #DA PROVARE
 # from dataclasses import dataclass 
 
 # @dataclass
@@ -392,7 +392,7 @@ def compute_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
 def compute_per_class_accuracy(
     logits: torch.Tensor, labels: torch.Tensor
 ) -> dict[str, float]:
-    preds = logits.argmax(dim=-1)
+    preds = logits.argmax(dim=-1) # prende classe predetta
     per_class: dict[str, float] = {}
 
     for c in range(NUM_SKILL_CLASSES):
@@ -435,8 +435,13 @@ def training_step(
     # PREPROCESSOR
     batch = preprocessor(batch)
 
+    # VERIFICARE che sia [B, 1, 28] e [B, 1, C, H, W] ovvero venga considerato un solo stato e frame
+    # print("state shape (after preprecessor):", batch["observation.state"].shape)
+    # print("image shape (after preprocessor):", batch["observation.images.top"].shape)
+
     # tronca lo stato ai primi 28 valori
     batch["observation.state"] = batch["observation.state"][:, :28]
+    # print("state shape (after trunk):", batch["observation.state"].shape)
     #print("Secondo: ",batch)
 
     # Reinierisci skill_label nel batch preprocessato
@@ -488,7 +493,7 @@ def training_step(
 # VALIDATION
 # ═════════════════════════════════════════════════════════════════════════════
 
-@torch.no_grad()
+@torch.no_grad() # disabilita calcolo dei gradienti
 def validate(
     policy: PI0Policy,
     val_loader: DataLoader,
@@ -497,7 +502,7 @@ def validate(
     num_batches: int | None = None,
 ) -> dict[str, float]:
     """Validation loop on val_loader."""
-    policy.eval()
+    policy.eval() # mette il modello in eval mode
 
     loss_meter = AverageMeter("val_loss")
     acc_meter = AverageMeter("val_accuracy")
@@ -644,14 +649,21 @@ def train(cfg, mode: str = "train_val") -> None:
     val_fraction = getattr(cfg.dataset, "val_fraction", 0.15)
     test_fraction = getattr(cfg.dataset, "test_fraction", 0.15)
 
-    # _test_eps is preserved for future evaluation (run a separate evaluate.py)
-    train_eps, val_eps, _test_eps = create_episode_splits(
+    # test_eps is preserved for future evaluation (run a separate evaluate.py)
+    train_eps, val_eps, test_eps = create_episode_splits(
         num_episodes=num_episodes,
         seed=cfg.seed,
         train_fraction=train_fraction,
         val_fraction=val_fraction,
         test_fraction=test_fraction,
     )
+
+    # Dopo create_episode_splits PROVARE
+    # for split_name, episodes in [("train", train_eps), ("val", val_eps), ("test", test_eps)]:
+    #     task_a = sum(1 for e in episodes if e < 200)
+    #     task_b = sum(1 for e in episodes if 200 <= e < 400)
+    #     task_c = sum(1 for e in episodes if e >= 400)
+    #     print(f"{split_name}: task_A={task_a}, task_B={task_b}, task_C={task_c}")
 
     train_raw = LeRobotDataset(
         repo_id=cfg.dataset.repo_id,
@@ -693,7 +705,7 @@ def train(cfg, mode: str = "train_val") -> None:
     val_loader = DataLoader(
         val_dataset,
         batch_size=cfg.batch_size,
-        shuffle=False,
+        shuffle=True,
         num_workers=cfg.num_workers,
         pin_memory=device.type == "cuda",
     )
@@ -725,10 +737,10 @@ def train(cfg, mode: str = "train_val") -> None:
     logging.info(f"input_features: {list(input_features.keys())}")
     #logging.info(f"output_features: {list(output_features.keys())}")
 
-    state_dim = 32  # default PI0Config
-    if "observation.state" in features_meta:
-        state_dim = features_meta["observation.state"]["shape"][0]
-        #logging.info(f"max_state_dim impostato a {state_dim} (da observation.state)")
+    # state_dim = 32  # default PI0Config
+    # if "observation.state" in features_meta:
+    #     state_dim = features_meta["observation.state"]["shape"][0]
+        # logging.info(f"max_state_dim impostato a {state_dim} (da observation.state)")
  
 
     base_policy_cfg = PI0Config()
@@ -896,13 +908,19 @@ def train(cfg, mode: str = "train_val") -> None:
 
         # ── Periodic validation ───────────────────────────────────────────
         if mode in ("train_val", "train_val_test") and step % cfg.eval_freq == 0:
+            t_val_start = time.perf_counter()
+
             val_metrics = validate(
                 policy=policy,
                 val_loader=val_loader,
                 device=device,
                 preprocessor=preprocessor,
-                num_batches=None, #getattr(cfg.training, "eval_num_batches", None),
+                num_batches=500 # getattr(cfg, "eval_num_batches", 50), # None
             )
+
+            val_time=time.perf_counter()-t_val_start
+            val_metrics["val/time_s"] = val_time  # aggiunge il tempo al dizionario
+
             val_summary = " | ".join(f"{k}={v:.4f}" for k, v in val_metrics.items())
             logging.info(f"Step {step:6d} [VAL] {val_summary}")
             
@@ -910,7 +928,7 @@ def train(cfg, mode: str = "train_val") -> None:
             if wandb_enabled: 
                 wandb.log(val_metrics, step=step)
 
-            # Salva il miglior checkpoint se la val loss migliora
+            # Salva il miglior checkpoint se la val loss migliora (tutti i pesi del modello)
             if val_metrics["val/loss"] < best_val_loss:
                 best_val_loss = val_metrics["val/loss"]
                 best_path = output_dir / "best_classifier.pt"
@@ -938,11 +956,29 @@ def train(cfg, mode: str = "train_val") -> None:
             update_last_checkpoint(ckpt_dir)
             logging.info(f"Checkpoint saved: {ckpt_dir}")
 
+            # Cancella il checkpoint precedente
+            prev_step = step - cfg.save_freq
+            if prev_step > 0:
+                prev_ckpt_dir = get_step_checkpoint_dir(
+                    output_dir=output_dir,
+                    total_steps=cfg.steps,
+                    step=prev_step,
+                )
+                if prev_ckpt_dir.exists():
+                    import shutil
+                    shutil.rmtree(prev_ckpt_dir)
+                    logging.info(f"Deleted old checkpoint: {prev_ckpt_dir}")
+
     # ── Load best checkpoint (if available) for final evaluation ─────────
     best_ckpt_path = output_dir / "best_classifier.pt"
     if best_ckpt_path.exists():
         logging.info(f"Loading best checkpoint for final evaluation: {best_ckpt_path}")
-        policy.load_state_dict(torch.load(best_ckpt_path, map_location=device))
+        # policy.load_state_dict(torch.load(best_ckpt_path, map_location=device))
+
+        # ALTERNATIVA
+        state_dict = torch.load(best_ckpt_path, map_location="cpu") # carica tensori temporaneamente in RAM (alloca memoria)
+        policy.load_state_dict(state_dict) # copia pesi nel modello in GPU
+        del state_dict # elimina riferimento python dal dizionario temporaneo
 
     # ── Final model saving ────────────────────────────────────────────────
     final_dir = output_dir / "final"
@@ -953,7 +989,7 @@ def train(cfg, mode: str = "train_val") -> None:
     # ── Final validation (skipped in 'train' mode) ───────────────────────
     if mode in ("train_val", "train_val_test"):
         logging.info("Running final full validation...")
-        final_val = validate(policy, val_loader, device, preprocessor=preprocessor, num_batches=None)
+        final_val = validate(policy, val_loader, device, preprocessor=preprocessor, num_batches=4000)
         logging.info("Final validation results:")
         for k, v in final_val.items():
             logging.info(f"  {k}: {v:.4f}")
@@ -973,7 +1009,7 @@ def train(cfg, mode: str = "train_val") -> None:
         test_raw = LeRobotDataset(
             repo_id=cfg.dataset.repo_id,
             root=cfg.dataset.root,
-            episodes=_test_eps,
+            episodes=test_eps,
             #image_transforms=cfg.dataset.image_transforms,
             #delta_timestamps=None, #cfg.dataset.delta_timestamps,
             #video_backend=cfg.dataset.video_backend,
@@ -1060,13 +1096,13 @@ if __name__ == "__main__":
     from lerobot.utils.import_utils import register_third_party_plugins
     register_third_party_plugins()   # carica i plugin PRIMA del parser
 
-    MODE = "train_val_test"  # cambia qui: "train", "train_val", "train_val_test"
+    MODE = "train_val"  # cambia qui: "train", "train_val", "train_val_test"
     @parser.wrap()
     def main(cfg: TrainPipelineConfig):
         logging.info(f"Mode: {MODE}")
         train(cfg, mode=MODE)
 
-    # DA PROVARE
+    # # DA PROVARE
     # @parser.wrap()
     # def main(cfg: PI0SkillTrainConfig):
     #     logging.info(f"Mode: {cfg.mode}")

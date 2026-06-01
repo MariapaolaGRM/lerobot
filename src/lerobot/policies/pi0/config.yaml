@@ -1,5 +1,5 @@
 dataset:
-  root: /home/mariapaolagerminario/dataset/behavior1k_training
+  root: /home/mariapaolagerminario/datasets/behavior1k_training
   repo_id: behavior-1k/2025-challenge-demos
 
 policy:
@@ -19,19 +19,21 @@ policy:
 wandb:
   enable: true
   project: pi0-skill-classifier
+
 save_checkpoint: true
-output_dir: outputs/skill_classifier_test_1
-batch_size: 4
-steps: 500
-log_freq: 20
-save_freq: 500
-#eval_freq: 500 # ogni quanto fare valutazione periodica
+output_dir: outputs/skill_classifier_test
+batch_size: 16
+steps: 50000
+log_freq: 100
+save_freq: 25000
+eval_freq: 1000 # ogni quanto fare valutazione periodica
 seed: 42
-resume: false
+resume: false # riaddestra sempre dallo step 0 (perde pesi giá appresi)
 
 # num_workers: 4
 
 # DA PROVARE
-# mode: train_val_test
-# eval_num_batches: 100
+#mode: train_val
+#eval_num_batches: 500
+job_name: pi0-skill-classifier-5
 
