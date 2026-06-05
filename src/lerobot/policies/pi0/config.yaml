@@ -19,6 +19,7 @@ policy:
 wandb:
   enable: true
   project: pi0-skill-classifier
+job_name: pi0-skill-classifier-7
 
 save_checkpoint: true
 output_dir: outputs/skill_classifier_test
@@ -33,7 +34,20 @@ resume: false # riaddestra sempre dallo step 0 (perde pesi giá appresi)
 # num_workers: 4
 
 # DA PROVARE
-#mode: train_val
-#eval_num_batches: 500
-job_name: pi0-skill-classifier-5
+mode: train_val_test # opzioni: "train", "train_val", "train_val_test", "test"
+eval_num_batches: 500
+test_num_batches: 6000
+
+# optimizer:
+#   lr: 2.5e-5
+#   betas: [0.9, 0.95]
+#   eps: 1e-8
+#   weight_decay: 1e-4
+#   grad_clip_norm: 1.0
+
+# RICORDA: 
+# cambiare mode per scegliere la modalità 
+# cambiare job-name per i test
+# eliminare cartella output prima di nuovo training
+
 

@@ -17,11 +17,6 @@ Usage:
 import os
 os.environ["LEROBOT_VIDEO_TIMESTAMP_TOLERANCE_S"] = "0.1"  # 10x la default
 
-#import importlib
-#from __future__ import annotations
-#from pprint import pformat
-#from lerobot.utils.import_utils import register_third_party_plugins
-
 import argparse
 import json
 import logging
@@ -37,6 +32,10 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 
+# Inference
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, classification_report, ConfusionMatrixDisplay
+
 # LeRobot imports
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
@@ -44,6 +43,8 @@ from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.logging_utils import AverageMeter
 from lerobot.utils.random_utils import set_seed
+from lerobot.utils.import_utils import register_third_party_plugins
+register_third_party_plugins()
 
 from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
@@ -81,26 +82,13 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # DA PROVARE
-# from dataclasses import dataclass 
+from dataclasses import dataclass 
 
-# @dataclass
-# class PI0SkillTrainConfig(TrainPipelineConfig):
-#     mode: str = "train_val"
-#     eval_num_batches: int | None = None
-
-
-# EVENTUALE ALTERNATIVA DI PREPROCESSING
-# from transformers import AutoTokenizer
-# _TOKENIZER = None
-# _TOKENIZER_NAME = "google/paligemma-3b-pt-224"
-# _TOKENIZER_MAX_LENGTH = 48
-
-# def get_tokenizer():
-#     global _TOKENIZER
-#     if _TOKENIZER is None:
-#         logging.info(f"Carico tokenizer: {_TOKENIZER_NAME}")
-#         _TOKENIZER = AutoTokenizer.from_pretrained(_TOKENIZER_NAME)
-#     return _TOKENIZER
+@dataclass
+class PI0SkillTrainConfig(TrainPipelineConfig):
+    mode: str = "train_val"
+    eval_num_batches: int | None = None
+    test_num_batches: int | None = None
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SKILL VOCABULARY
@@ -123,6 +111,7 @@ CLASS_TO_SKILL_NAME = {cls: name for _, (cls, name) in SKILL_REGISTRY.items()}
 NUM_SKILL_CLASSES = len(SKILL_REGISTRY)
 IGNORE_LABEL = -100
 
+CLASS_NAMES        = [CLASS_TO_SKILL_NAME[i] for i in range(NUM_SKILL_CLASSES)]
 
 # ═════════════════════════════════════════════════════════════════════════════
 # HELPERS
@@ -133,45 +122,6 @@ def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[st
         k: v.to(device) if isinstance(v, torch.Tensor) else v
         for k, v in batch.items()
     }
- 
-    # PI0 legge sempre i token di linguaggio dal batch prima del check
-    # classifier_mode — se non ci sono li aggiungo vuoti (sequenza di zeri).
-    # tokenizer_max_length default = 48 (da PI0Config).
-    # if "observation.language.tokens" not in batch:
-    #     B = next(v.shape[0] for v in batch.values() if isinstance(v, torch.Tensor))
-    #     T = 48  # tokenizer_max_length default
-    #     batch["observation.language.tokens"] = torch.zeros(
-    #         B, T, dtype=torch.long, device=device
-    #     )
-    #     batch["observation.language.attention_mask"] = torch.zeros(
-    #         B, T, dtype=torch.bool, device=device
-    #     )
-    
-    # EVENTUALE ALTERNATIVA DI PREPROCESSING
-    # if "observation.language.tokens" not in batch:
-    #     tokenizer = get_tokenizer()
-    #     tasks = batch.get("task", None)
-
-    #     if tasks is None or (isinstance(tasks, list) and all(t == "" for t in tasks)):
-    #         B = next(v.shape[0] for v in batch.values() if isinstance(v, torch.Tensor))
-    #         tokens = torch.zeros(B, _TOKENIZER_MAX_LENGTH, dtype=torch.long, device=device)
-    #         mask   = torch.zeros(B, _TOKENIZER_MAX_LENGTH, dtype=torch.long, device=device)
-    #     else:
-    #         if isinstance(tasks, str):
-    #             tasks = [tasks]
-    #         tasks = [t if t.endswith("\n") else f"{t}\n" for t in tasks]
-    #         encoded = tokenizer(
-    #             tasks,
-    #             max_length=_TOKENIZER_MAX_LENGTH,
-    #             padding="max_length",
-    #             truncation=True,
-    #             return_tensors="pt",
-    #         )
-    #         tokens = encoded["input_ids"].to(device)
-    #         mask   = encoded["attention_mask"].to(device)
-
-    #     batch["observation.language.tokens"]        = tokens
-    #     batch["observation.language.attention_mask"] = mask
  
     return batch
 
@@ -390,9 +340,14 @@ def compute_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
 
 
 def compute_per_class_accuracy(
-    logits: torch.Tensor, labels: torch.Tensor
+    logits_or_preds: torch.Tensor, #logits: torch.Tensor,
+    labels: torch.Tensor, 
+    already_argmax: bool = False,
 ) -> dict[str, float]:
-    preds = logits.argmax(dim=-1) # prende classe predetta
+    #preds = logits.argmax(dim=-1) # prende classe predetta
+
+    preds = logits_or_preds if already_argmax else logits_or_preds.argmax(dim=-1)
+    
     per_class: dict[str, float] = {}
 
     for c in range(NUM_SKILL_CLASSES):
@@ -405,6 +360,17 @@ def compute_per_class_accuracy(
 
     return per_class
 
+# ── Confusion matrix plot ────────────────────────────────────────────────────
+
+def plot_confusion_matrix(cm: np.ndarray, class_names: list[str], output_path: Path):
+    fig, ax = plt.subplots(figsize=(10, 8))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+    disp.plot(ax=ax, colorbar=True, xticks_rotation=45, cmap="Blues")
+    ax.set_title("Confusion Matrix — Skill Classifier", fontsize=14, pad=16)
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    log.info(f"Confusion matrix saved: {output_path}")
 
 # ═════════════════════════════════════════════════════════════════════════════
 # TRAINING STEP
@@ -425,28 +391,13 @@ def training_step(
     
     batch = move_batch_to_device(batch, device)
 
-    # Salva skill_label prima che il preprocessor la rimuova
-    #labels = batch.pop("skill_label")
-
-    #print("Primo: ",batch)
-
     labels = batch["skill_label"]
 
     # PREPROCESSOR
     batch = preprocessor(batch)
 
-    # VERIFICARE che sia [B, 1, 28] e [B, 1, C, H, W] ovvero venga considerato un solo stato e frame
-    # print("state shape (after preprecessor):", batch["observation.state"].shape)
-    # print("image shape (after preprocessor):", batch["observation.images.top"].shape)
-
     # tronca lo stato ai primi 28 valori
     batch["observation.state"] = batch["observation.state"][:, :28]
-    # print("state shape (after trunk):", batch["observation.state"].shape)
-    #print("Secondo: ",batch)
-
-    # Reinierisci skill_label nel batch preprocessato
-    #batch["skill_label"] = labels
-    #print("Terzo: ",batch)
 
     ctx = (
         torch.autocast(device_type=device.type, dtype=torch.bfloat16)
@@ -521,13 +472,6 @@ def validate(
         # tronca lo stato ai primi 28 valori
         batch["observation.state"] = batch["observation.state"][:, :28]
 
-        # Salva skill_label prima che il preprocessor la rimuova
-        # labels = batch.pop("skill_label")
-        # # PREPROCESSOR
-        # batch = preprocessor(batch)
-        # # Reinierisci skill_label nel batch preprocessato
-        # batch["skill_label"] = labels
-
         output = policy.forward(batch)
         logits, loss, _ = unpack_policy_output(output)
         if loss is None:
@@ -554,41 +498,161 @@ def validate(
         **{f"val/acc_{name}": acc for name, acc in per_class.items()},
     }
 
-
 # ═════════════════════════════════════════════════════════════════════════════
-# FINAL TEST
+# MAIN LOOP
 # ═════════════════════════════════════════════════════════════════════════════
+def build_everything(cfg, device):
+     # ── Dataset ───────────────────────────────────────────────────────────
+    logging.info("Loading dataset...")
+    dataset_root = Path(cfg.dataset.root).expanduser().resolve()
+    annotations_root = dataset_root / "annotations"
 
-@torch.no_grad()
-def test(
-    policy: PI0Policy,
-    test_loader: DataLoader,
-    device: torch.device,
-    preprocessor, # PREPROCESSOR
-) -> dict[str, float]:
-    """Final evaluation on the test set (use only once, at the end)."""
-    logging.info("\n==============================")
-    logging.info("Running FINAL TEST evaluation")
-    logging.info("==============================")
+    # import json
+    info = json.load(open(dataset_root / "meta" / "info.json"))
+    num_episodes = info["total_episodes"]
 
-    metrics = validate(
-        policy=policy,
-        val_loader=test_loader,
-        device=device,
-        preprocessor=preprocessor, # PREPROCESSOR
-        num_batches=None, # num_batches=cfg.eval_num_batches # DA PROVARE (None = tutti i dati di test)
-    ) 
+    logging.info(f"Annotations from: {annotations_root}")
+    logging.info(f"Total episodes: {num_episodes}")
 
-    for k, v in metrics.items():
-        logging.info(f"{k}: {v:.4f}")
+    train_fraction = getattr(cfg.dataset, "train_fraction", 0.7)
+    val_fraction = getattr(cfg.dataset, "val_fraction", 0.15)
+    test_fraction = getattr(cfg.dataset, "test_fraction", 0.15)
 
-    return metrics
+    # test_eps is preserved for future evaluation (run a separate evaluate.py)
+    train_eps, val_eps, test_eps = create_episode_splits(
+        num_episodes=num_episodes,
+        seed=cfg.seed,
+        train_fraction=train_fraction,
+        val_fraction=val_fraction,
+        test_fraction=test_fraction,
+    )   
+
+    train_raw = LeRobotDataset(
+        repo_id=cfg.dataset.repo_id,
+        root=cfg.dataset.root,
+        episodes=train_eps,
+        revision="main",
+        force_cache_sync=False,
+    )
+    val_raw = LeRobotDataset(
+        repo_id=cfg.dataset.repo_id,
+        root=cfg.dataset.root,
+        episodes=val_eps,
+        revision="main",
+        force_cache_sync=False,
+    )
+    test_raw = LeRobotDataset(
+        repo_id=cfg.dataset.repo_id,
+        root=cfg.dataset.root,
+        episodes=test_eps,
+        revision="main",
+        force_cache_sync=False,
+    )
+
+    train_dataset = SkillLabeledDataset(train_raw, annotations_root, ignore_unlabeled=False)
+    val_dataset = SkillLabeledDataset(val_raw, annotations_root, ignore_unlabeled=False)
+    test_dataset = SkillLabeledDataset(test_raw, annotations_root, ignore_unlabeled=False)
+    logging.info(
+        f"Samples — train: {len(train_dataset)}, val: {len(val_dataset)}, test: {len(test_dataset)}"
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=device.type == "cuda",
+        drop_last=len(train_dataset) >= cfg.batch_size,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        pin_memory=device.type == "cuda",
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=True, # False per avere sempre gli stessi batch in ogni test 
+        num_workers=cfg.num_workers,
+        pin_memory=device.type == "cuda",
+    )
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# MAIN TRAINING LOOP
-# ═════════════════════════════════════════════════════════════════════════════
+    # ── Policy ────────────────────────────────────────────────────────────
+    logging.info("Loading PI0 policy...")
 
+    input_features: dict = {}
+    features_meta = train_raw.meta.features  # dict chiave → {dtype, shape, ...}
+    for key, feat in features_meta.items():
+        if key.startswith("observation.images"):
+            # Le immagini hanno shape (C, H, W)
+            shape = tuple(feat["shape"])  # es. (3, 480, 640)
+            input_features[key] = PolicyFeature(type=FeatureType.VISUAL, shape=shape)
+        elif key == "observation.state":
+            #shape = tuple(feat["shape"])
+            input_features[key] = PolicyFeature(type=FeatureType.STATE, shape=(28,))
+
+    output_features: dict = {}
+    if "action" in features_meta:
+        shape = tuple(features_meta["action"]["shape"])
+        output_features["action"] = PolicyFeature(type=FeatureType.ACTION, shape=shape)
+
+    logging.info(f"input_features: {list(input_features.keys())}")
+
+    base_policy_cfg = PI0Config()
+    policy_cfg = PI0Config(
+        input_features=input_features,
+        output_features=output_features,
+        **{
+            k: v
+            for k, v in vars(cfg.policy).items()
+            if k not in ( #"classifier_mode", "train_expert_only", "num_subskill_classes",
+                         "input_features", "output_features","max_action_dim") # parametri ignorati se passati nel config
+            and hasattr(base_policy_cfg, k)
+        },
+
+    )
+
+    policy = PI0Policy.from_pretrained(
+        cfg.policy.pretrained_path, #cfg.policy.pretrained_model_name_or_path,
+        config=policy_cfg,
+        strict=False,
+        ignore_mismatched_sizes=True,
+        torch_dtype=torch.bfloat16,
+        #torch_dtype=torch.float16, # pesi caricati in fp16 
+    ).to(device)
+
+    preprocessor, postprocessor = make_pi0_pre_post_processors(
+        config=policy_cfg,
+        dataset_stats=train_raw.meta.stats,
+    )
+
+    allocated = torch.cuda.memory_allocated() / 1e9
+    reserved  = torch.cuda.memory_reserved() / 1e9
+    print(f"GPU dopo caricamento modello: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+    #raise SystemExit("DEBUG STOP")
+
+    trainable = [(n, p.numel()) for n, p in policy.named_parameters() if p.requires_grad]
+    frozen = [(n, p.numel()) for n, p in policy.named_parameters() if not p.requires_grad]
+    logging.info(f"Trainable parameters ({len(trainable)}):")
+    for name, numel in trainable:
+        logging.info(f"  {name:60s} {numel:>10,}")
+    logging.info(
+        f"Total trainable: {sum(n for _, n in trainable):,} | "
+        f"Total frozen:    {sum(n for _, n in frozen):,}"
+    )
+
+    return (
+        policy,
+        preprocessor,
+        train_loader,
+        val_loader,
+        test_loader,
+    )
+
+# ── Train and val ────────────────────────────────────────────────────────
 def train(cfg, mode: str = "train_val") -> None:
     """Main training loop.
 
@@ -611,7 +675,10 @@ def train(cfg, mode: str = "train_val") -> None:
             config={
                 "num_train_steps": cfg.steps, 
                 "batch_size": cfg.batch_size,
-                "lr": cfg.optimizer.lr if cfg.optimizer else 2.5e-5, #cfg.optimizer.lr,
+                #"lr": cfg.optimizer.lr if cfg.optimizer else 2.5e-5, #cfg.optimizer.lr,
+                "weight_decay": getattr(cfg.optimizer, "weight_decay", 1e-4),
+                "lr_gemma_expert": 2.5e-6,
+                "lr_classifier": 2.5e-5,
                 "grad_clip_norm": cfg.optimizer.grad_clip_norm if cfg.optimizer else 10.0, #cfg.training.grad_clip_norm,
                 "seed": cfg.seed,
                 "device": str(device),
@@ -621,192 +688,39 @@ def train(cfg, mode: str = "train_val") -> None:
         )
         logging.info(f"W&B run: {wandb.run.name} — {wandb.run.url}")
 
-    # ── Dataset ───────────────────────────────────────────────────────────
-    logging.info("Loading dataset...")
-    dataset_root = Path(cfg.dataset.root).expanduser().resolve()
-    annotations_root = dataset_root / "annotations"
-
-    # import json
-    info = json.load(open(dataset_root / "meta" / "info.json"))
-    num_episodes = info["total_episodes"]
-
-    logging.info(f"Annotations from: {annotations_root}")
-    logging.info(f"Total episodes: {num_episodes}")
-    # full_dataset = LeRobotDataset(
-    #     repo_id=cfg.dataset.repo_id,
-    #     root=cfg.dataset.root,
-    #     episodes=cfg.dataset.episodes,
-    #     image_transforms=cfg.dataset.image_transforms,
-    #     delta_timestamps=cfg.dataset.delta_timestamps,
-    #     video_backend=cfg.dataset.video_backend,
-    # )
-
-    # annotations_root = Path(full_dataset.root) / "annotations"
-    # logging.info(f"Annotations from: {annotations_root}")
-    # num_episodes = full_dataset.num_episodes
-
-    train_fraction = getattr(cfg.dataset, "train_fraction", 0.7)
-    val_fraction = getattr(cfg.dataset, "val_fraction", 0.15)
-    test_fraction = getattr(cfg.dataset, "test_fraction", 0.15)
-
-    # test_eps is preserved for future evaluation (run a separate evaluate.py)
-    train_eps, val_eps, test_eps = create_episode_splits(
-        num_episodes=num_episodes,
-        seed=cfg.seed,
-        train_fraction=train_fraction,
-        val_fraction=val_fraction,
-        test_fraction=test_fraction,
-    )
-
-    # Dopo create_episode_splits PROVARE
-    # for split_name, episodes in [("train", train_eps), ("val", val_eps), ("test", test_eps)]:
-    #     task_a = sum(1 for e in episodes if e < 200)
-    #     task_b = sum(1 for e in episodes if 200 <= e < 400)
-    #     task_c = sum(1 for e in episodes if e >= 400)
-    #     print(f"{split_name}: task_A={task_a}, task_B={task_b}, task_C={task_c}")
-
-    train_raw = LeRobotDataset(
-        repo_id=cfg.dataset.repo_id,
-        root=cfg.dataset.root,
-        episodes=train_eps,
-        #image_transforms=cfg.dataset.image_transforms,
-        #delta_timestamps=None, #cfg.dataset.delta_timestamps,
-        #video_backend=cfg.dataset.video_backend,
-        revision="main",
-        force_cache_sync=False,
-    )
-    val_raw = LeRobotDataset(
-        repo_id=cfg.dataset.repo_id,
-        root=cfg.dataset.root,
-        episodes=val_eps,
-        #image_transforms=cfg.dataset.image_transforms,
-        #delta_timestamps=None, #cfg.dataset.delta_timestamps,
-        #video_backend=cfg.dataset.video_backend,
-        revision="main",
-        force_cache_sync=False,
-    )
-
-    train_dataset = SkillLabeledDataset(train_raw, annotations_root, ignore_unlabeled=False)
-    val_dataset = SkillLabeledDataset(val_raw, annotations_root, ignore_unlabeled=False)
-    logging.info(
-        f"Samples — train: {len(train_dataset)}, val: {len(val_dataset)}"
-    )
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        pin_memory=device.type == "cuda",
-        drop_last=len(train_dataset) >= cfg.batch_size,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        pin_memory=device.type == "cuda",
-    )
-
-    # ── Policy ────────────────────────────────────────────────────────────
-    logging.info("Loading PI0 policy...")
-
-    input_features: dict = {}
-    features_meta = train_raw.meta.features  # dict chiave → {dtype, shape, ...}
-    for key, feat in features_meta.items():
-        if key.startswith("observation.images"):
-            # Le immagini hanno shape (C, H, W)
-            shape = tuple(feat["shape"])  # es. (3, 480, 640)
-            input_features[key] = PolicyFeature(type=FeatureType.VISUAL, shape=shape)
-        elif key == "observation.state":
-            #shape = tuple(feat["shape"])
-            input_features[key] = PolicyFeature(type=FeatureType.STATE, shape=(28,))
-
-    # input_features["task"] = PolicyFeature( # PREPROCESSOR
-    #     type=FeatureType.TEXT,
-    #     shape=(1,),
-    # )
-
-    output_features: dict = {}
-    if "action" in features_meta:
-        shape = tuple(features_meta["action"]["shape"])
-        output_features["action"] = PolicyFeature(type=FeatureType.ACTION, shape=shape)
-
-    logging.info(f"input_features: {list(input_features.keys())}")
-    #logging.info(f"output_features: {list(output_features.keys())}")
-
-    # state_dim = 32  # default PI0Config
-    # if "observation.state" in features_meta:
-    #     state_dim = features_meta["observation.state"]["shape"][0]
-        # logging.info(f"max_state_dim impostato a {state_dim} (da observation.state)")
- 
-
-    base_policy_cfg = PI0Config()
-    policy_cfg = PI0Config(
-        input_features=input_features,
-        output_features=output_features,
-        #max_state_dim=state_dim,
-        **{
-            k: v
-            for k, v in vars(cfg.policy).items()
-            if k not in ( #"classifier_mode", "train_expert_only", "num_subskill_classes",
-                         "input_features", "output_features","max_action_dim") # parametri ignorati se passati nel config
-            and hasattr(base_policy_cfg, k)
-        },
-
-    )
-
-    policy = PI0Policy.from_pretrained(
-        cfg.policy.pretrained_path, #cfg.policy.pretrained_model_name_or_path,
-        config=policy_cfg,
-        strict=False,
-        ignore_mismatched_sizes=True,
-
-        torch_dtype=torch.bfloat16,
-        #torch_dtype=torch.float16, # pesi caricati in fp16 
-    ).to(device)
-
-    # PREPROCESSOR
-    # processor_kwargs = {
-    #     "dataset_stats": train_raw.meta.stats,
-    # }
-    # postprocessor_kwargs = {}
-    # preprocessor, postprocessor = make_pre_post_processors(
-    #     policy_cfg=policy_cfg,
-    #     pretrained_path=cfg.policy.pretrained_path,
-    #     **processor_kwargs,
-    #     **postprocessor_kwargs,
-    # )
-
-    preprocessor, postprocessor = make_pi0_pre_post_processors(
-        config=policy_cfg,
-        dataset_stats=train_raw.meta.stats,
-    )
-
-    allocated = torch.cuda.memory_allocated() / 1e9
-    reserved  = torch.cuda.memory_reserved() / 1e9
-    print(f"GPU dopo caricamento modello: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
-    #raise SystemExit("DEBUG STOP")
-
-    trainable = [(n, p.numel()) for n, p in policy.named_parameters() if p.requires_grad]
-    frozen = [(n, p.numel()) for n, p in policy.named_parameters() if not p.requires_grad]
-    logging.info(f"Trainable parameters ({len(trainable)}):")
-    for name, numel in trainable:
-        logging.info(f"  {name:60s} {numel:>10,}")
-    logging.info(
-        f"Total trainable: {sum(n for _, n in trainable):,} | "
-        f"Total frozen:    {sum(n for _, n in frozen):,}"
-    )
+    policy,preprocessor,train_loader,val_loader,test_loader=build_everything(cfg,device)
 
     # ── Optimizer and scheduler ───────────────────────────────────────────
     trainable_params = [p for p in policy.parameters() if p.requires_grad]
+
+    # LR differenziati
+    backbone_params = []
+    classifier_params = []
+    for name, p in policy.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "classifier_head" in name or "attn_pool" in name:
+            classifier_params.append(p)
+        else:
+            backbone_params.append(p)
     optimizer = AdamW(
-        trainable_params,
-        lr=cfg.optimizer.lr if cfg.optimizer else 2.5e-5, #cfg.optimizer.lr, getattr(cfg.optimizer, "lr", 2.5e-5),
+        [
+            {"params": backbone_params, "lr": 2.5e-6}, # 1e-5
+            {"params": classifier_params, "lr": 2.5e-5}, # 1e-4
+        ],
         betas=getattr(cfg.optimizer, "betas", (0.9, 0.95)),
         eps=getattr(cfg.optimizer, "eps", 1e-8),
-        weight_decay=getattr(cfg.optimizer, "weight_decay", 1e-4), # Weight decay (originale: 1e-10)
+        weight_decay=getattr(cfg.optimizer, "weight_decay", 1e-4),
     )
+
+    # optimizer = AdamW(
+    #     trainable_params,
+    #     lr=cfg.optimizer.lr if cfg.optimizer else 2.5e-5, #cfg.optimizer.lr, getattr(cfg.optimizer, "lr", 2.5e-5),
+    #     betas=getattr(cfg.optimizer, "betas", (0.9, 0.95)),
+    #     eps=getattr(cfg.optimizer, "eps", 1e-8),
+    #     weight_decay=getattr(cfg.optimizer, "weight_decay", 1e-4), # Weight decay (originale: 1e-10)
+    # )
+
     scheduler = CosineAnnealingLR(
         optimizer,
         T_max=cfg.steps, #cfg.training.num_train_steps,
@@ -842,7 +756,7 @@ def train(cfg, mode: str = "train_val") -> None:
 
     best_val_loss = float("inf")
 
-    # Early stopping 
+    # ── Early stopping ─────────────────────────────────────────────────────
     patience = 5  # ferma dopo 5 validazioni senza miglioramento
     no_improve_count = 0
 
@@ -883,12 +797,17 @@ def train(cfg, mode: str = "train_val") -> None:
             avg_acc = acc_meter.avg
             avg_grad = grad_norm_meter.avg
             current_lr = scheduler.get_last_lr()[0]
+
+            lr_gemma = scheduler.get_last_lr()[0] # LR differenziati
+            lr_cls   = scheduler.get_last_lr()[1]
             logging.info(
                 f"Step {step:6d}/{cfg.steps} | "
                 f"loss={avg_loss:.4f} | "
                 f"acc={avg_acc:.3f} | "
                 f"grad={avg_grad:.3f} | "
                 f"lr={current_lr:.2e} | "
+                f"lr_gemma={lr_gemma:.2e} | " # LR differenziati
+                f"lr_cls={lr_cls:.2e} | "
                 f"t={step_time_meter.avg:.3f}s"
             )
             # if USE_WANDB:
@@ -900,6 +819,9 @@ def train(cfg, mode: str = "train_val") -> None:
                         "train/grad_norm": avg_grad,
                         "train/lr": current_lr,
                         "train/step_time": step_time_meter.avg,
+
+                        "train/lr_gemma_expert": optimizer.param_groups[0]["lr"], # LR differenziati
+                        "train/lr_classifier":   optimizer.param_groups[1]["lr"],
                     },
                     step=step,
                 )
@@ -917,7 +839,7 @@ def train(cfg, mode: str = "train_val") -> None:
                 val_loader=val_loader,
                 device=device,
                 preprocessor=preprocessor,
-                num_batches=500 # getattr(cfg, "eval_num_batches", 50), # None cfg.eval_num_batches or None
+                num_batches=cfg.eval_num_batches or 500 # getattr(cfg, "eval_num_batches", 50), # None cfg.eval_num_batches or None
             )
 
             val_time=time.perf_counter()-t_val_start
@@ -933,8 +855,8 @@ def train(cfg, mode: str = "train_val") -> None:
             # Salva il miglior checkpoint se la val loss migliora (tutti i pesi del modello)
             if val_metrics["val/loss"] < best_val_loss: # - min_delta:
                 # Early stopping
-                #best_val_loss = val_metrics["val/loss"]
                 no_improve_count = 0
+
                 best_val_loss = val_metrics["val/loss"]
                 best_path = output_dir / "best_classifier.pt"
                 torch.save(policy.state_dict(), best_path)
@@ -1000,7 +922,7 @@ def train(cfg, mode: str = "train_val") -> None:
     # ── Final validation (skipped in 'train' mode) ───────────────────────
     if mode in ("train_val", "train_val_test"):
         logging.info("Running final full validation...")
-        final_val = validate(policy, val_loader, device, preprocessor=preprocessor, num_batches=4000)
+        final_val = validate(policy, val_loader, device, preprocessor=preprocessor, num_batches=5000)
         logging.info("Final validation results:")
         for k, v in final_val.items():
             logging.info(f"  {k}: {v:.4f}")
@@ -1010,46 +932,6 @@ def train(cfg, mode: str = "train_val") -> None:
     else:
         logging.info("Skipping final validation (mode='train').")
 
-    # ── Final test (only in 'train_val_test' mode) ────────────────────────
-    if mode == "train_val_test":
-        best_ckpt_path = output_dir / "best_classifier.pt"
-        if best_ckpt_path.exists():
-            logging.info(f"Loading best checkpoint for test: {best_ckpt_path}")
-            policy.load_state_dict(torch.load(best_ckpt_path, map_location=device))
-
-        test_raw = LeRobotDataset(
-            repo_id=cfg.dataset.repo_id,
-            root=cfg.dataset.root,
-            episodes=test_eps,
-            #image_transforms=cfg.dataset.image_transforms,
-            #delta_timestamps=None, #cfg.dataset.delta_timestamps,
-            #video_backend=cfg.dataset.video_backend,
-
-            revision="main",
-            force_cache_sync=False,
-        )
-        test_dataset = SkillLabeledDataset(test_raw, annotations_root, ignore_unlabeled=False)
-        logging.info(f"Samples — test: {len(test_dataset)}")
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=cfg.batch_size,
-            shuffle=False,
-            num_workers=cfg.num_workers,
-            pin_memory=device.type == "cuda",
-        )
-        final_test = test(policy, test_loader, device, preprocessor=preprocessor)
-        logging.info("Final TEST results:")
-        for k, v in final_test.items():
-            logging.info(f"  {k}: {v:.4f}")
-        # if USE_WANDB:
-        if wandb_enabled: 
-            wandb.log({f"test/{k}": v for k, v in final_test.items()})
-    else:
-        logging.info(
-            f"Skipping final test (mode='{mode}'). "
-            "Re-run with --mode train_val_test to evaluate on the test set."
-        )
-
     # ── W&B finish ────────────────────────────────────────────────────────
     # if USE_WANDB:
     if wandb_enabled: 
@@ -1057,67 +939,167 @@ def train(cfg, mode: str = "train_val") -> None:
     logging.info("Training complete.")
 
 
+# ── Test ────────────────────────────────────────────────────────
+@torch.no_grad()
+def run_test(cfg, num_batches: int | None):
+    set_seed(cfg.seed)
+    device = torch.device(getattr(cfg, "device", "cuda"))
+    logging.info(f"Device: {device}")
+
+    output_dir = Path(cfg.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    policy,preprocessor,train_loader,val_loader,test_loader=build_everything(cfg, device)
+
+    best_ckpt_path = Path(cfg.output_dir) / "best_classifier.pt"
+
+    logging.info(
+        f"Loading checkpoint: {best_ckpt_path}"
+    )
+
+    state_dict = torch.load(
+        best_ckpt_path,
+        map_location="cpu",
+    )
+    policy.load_state_dict(state_dict)
+    del state_dict
+
+    policy.eval()
+
+    # ── Inference loop ────────────────────────────────────────────────────────
+    all_preds  = []
+    all_labels = []
+    total_loss = 0.0
+    n_valid_total = 0
+
+    for i, batch in enumerate(test_loader):
+        if num_batches is not None and i >= num_batches:
+            break
+
+        if i % 50 == 0:
+            log.info(f"  Batch {i} / {len(test_loader) if num_batches is None else num_batches} ...")
+
+        batch  = move_batch_to_device(batch, device)
+        labels = batch["skill_label"]
+        batch  = preprocessor(batch)
+        batch["observation.state"] = batch["observation.state"][:, :28]
+
+        output         = policy.forward(batch)
+        logits, loss, _ = unpack_policy_output(output)
+        if loss is None:
+            loss = F.cross_entropy(logits, labels, ignore_index=IGNORE_LABEL)
+
+        valid_mask = labels != IGNORE_LABEL
+        n_valid    = valid_mask.sum().item()
+        if n_valid > 0:
+            total_loss    += loss.item() * n_valid
+            n_valid_total += n_valid
+
+        preds = logits.argmax(dim=-1)
+        # Tieni solo sample con label valida
+        all_preds.append(preds[valid_mask].cpu())
+        all_labels.append(labels[valid_mask].cpu())
+
+    all_preds  = torch.cat(all_preds).numpy()
+    all_labels = torch.cat(all_labels).numpy()
+    avg_loss   = total_loss / max(n_valid_total, 1)
+    accuracy   = (all_preds == all_labels).mean()
+
+    log.info(f"\n{'='*50}")
+    log.info(f"  Samples:  {len(all_labels)} (labeled)")
+    log.info(f"  Loss:     {avg_loss:.4f}")
+    log.info(f"  Accuracy: {accuracy:.4f}")
+    log.info(f"{'='*50}\n")
+
+    # ── Per-class accuracy ────────────────────────────────────────────────────
+    # log.info("Per-class accuracy:")
+    # for c, name in CLASS_TO_SKILL_NAME.items():
+    #     mask = all_labels == c
+    #     if mask.sum() == 0:
+    #         log.info(f"  {name:20s}  — no samples")
+    #         continue
+    #     acc = (all_preds[mask] == c).mean()
+    #     log.info(f"  {name:20s}  {acc:.3f}  ({mask.sum()} samples)")
+    
+    log.info("Per-class accuracy:")
+    preds_tensor = torch.from_numpy(all_preds)
+    labels_tensor = torch.from_numpy(all_labels)
+    per_class = compute_per_class_accuracy(preds_tensor, labels_tensor, already_argmax=True)
+
+    for name, acc in per_class.items():
+        log.info(f"  {name:20s}  {acc:.3f}")
+    # for c, name in CLASS_TO_SKILL_NAME.items():
+    #     mask = all_labels == c
+    #     if mask.sum() == 0:
+    #         log.info(f"  {name:20s}  — no samples")
+    #         continue
+    #     acc = per_class[name]
+    #     log.info(f"  {name:20s}  {acc:.3f}  ({mask.sum()} samples)")
+
+    # ── Classification report ─────────────────────────────────────────────────
+    report = classification_report(
+        all_labels, all_preds,
+        labels=list(range(NUM_SKILL_CLASSES)),
+        target_names=CLASS_NAMES,
+        zero_division=0,
+    )
+    log.info(f"\nClassification report:\n{report}")
+
+    report_path = output_dir / f"classification_report.txt"
+    report_path.write_text(report)
+    log.info(f"Classification report saved: {report_path}")
+
+    # ── Confusion matrix ──────────────────────────────────────────────────────
+    cm = confusion_matrix(all_labels, all_preds, labels=list(range(NUM_SKILL_CLASSES)))
+    plot_confusion_matrix(cm, CLASS_NAMES, output_dir / f"confusion_matrix.png")
+
+    # Normalizzata (per riga) — utile con classi sbilanciate
+    cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True).clip(min=1)
+    plot_confusion_matrix(cm_norm, CLASS_NAMES, output_dir / f"confusion_matrix_normalized.png")
+
+    # ── Salva summary JSON ────────────────────────────────────────────────────
+    summary = {
+        "n_samples": int(len(all_labels)),
+        "loss": float(avg_loss),
+        "accuracy": float(accuracy),
+        "per_class_accuracy_before": {
+            CLASS_TO_SKILL_NAME[c]: float((all_preds[all_labels == c] == c).mean())
+            if (all_labels == c).sum() > 0 else None
+            for c in range(NUM_SKILL_CLASSES)
+        },
+        "per_class_accuracy": {
+            CLASS_TO_SKILL_NAME[c]: per_class.get(CLASS_TO_SKILL_NAME[c])
+            for c in range(NUM_SKILL_CLASSES)
+        },
+    }
+    summary_path = output_dir / f"summary_test.json"
+    summary_path.write_text(json.dumps(summary, indent=2))
+    log.info(f"Summary saved: {summary_path}")
+
+    return summary
 # ═════════════════════════════════════════════════════════════════════════════
 # ENTRYPOINT
 # ═════════════════════════════════════════════════════════════════════════════
-# if __name__ == "__main__":
-#     # ── Mode selector (must be stripped before lerobot parser sees argv) ──
-#     mode_parser = argparse.ArgumentParser(add_help=False)
-#     mode_parser.add_argument(
-#         "--mode",
-#         choices=["train", "train_val", "train_val_test"],
-#         default="train_val",
-#     )
-#     mode_args, remaining_argv = mode_parser.parse_known_args()
-
-#     import sys
-#     sys.argv = [sys.argv[0]] + remaining_argv
-
-#     cfg = parser.parse_args_into_dataclasses(TrainPipelineConfig)[0]
-#     logging.info(f"Config:\n{pformat(vars(cfg))}")
-#     logging.info(f"Mode: {mode_args.mode}")
-#     train(cfg, mode=mode_args.mode)
-#     main()
-
-# if __name__ == "__main__":
-#     import sys
-
-#     mode_parser = argparse.ArgumentParser(add_help=False)
-#     mode_parser.add_argument(
-#         "--mode",
-#         choices=["train", "train_val", "train_val_test"],
-#         default="train_val",
-#     )
-
-#     mode_args, remaining_argv = mode_parser.parse_known_args()
-
-#     sys.argv = [sys.argv[0]] + remaining_argv
-
-#     @parser.wrap()
-#     def main(cfg: TrainPipelineConfig):
-
-#         logging.info(f"Config:\n{pformat(vars(cfg))}")
-#         logging.info(f"Mode: {mode_args.mode}")
-
-#         train(cfg, mode=mode_args.mode)
-
-#     main()
-
 
 if __name__ == "__main__":
-    from lerobot.utils.import_utils import register_third_party_plugins
-    register_third_party_plugins()   # carica i plugin PRIMA del parser
-
-    MODE = "train_val"  # cambia qui: "train", "train_val", "train_val_test"
-    @parser.wrap()
-    def main(cfg: TrainPipelineConfig):
-        logging.info(f"Mode: {MODE}")
-        train(cfg, mode=MODE)
-
-    # # DA PROVARE
+    # mode = "test"  # cambia qui: "train", "train_val", "train_val_test", "test"
     # @parser.wrap()
-    # def main(cfg: PI0SkillTrainConfig):
-    #     logging.info(f"Mode: {cfg.mode}")
-    #     train(cfg, mode=cfg.mode)
+    # def main(cfg: TrainPipelineConfig):
+    #     logging.info(f"Mode: {mode}")
+        # train(cfg, mode)
 
+    # DA PROVARE - FUNZIONANTE
+    @parser.wrap()
+    def main(cfg: PI0SkillTrainConfig):
+        mode = cfg.mode
+        logging.info(f"Mode: {mode}")
+
+        test_num_batches = cfg.test_num_batches
+        if mode == "test":
+            run_test(cfg, num_batches=test_num_batches)
+        elif mode == "train_val_test":
+            train(cfg, mode)
+            run_test(cfg, num_batches=test_num_batches)
+        else:
+            train(cfg, mode)
     main()
