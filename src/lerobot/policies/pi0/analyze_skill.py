@@ -7,9 +7,10 @@ e genera automaticamente il blocco SKILL_REGISTRY da copiare in
 train_skill_classifier.py.
 
 Usage:
-    python analyze_skill_distribution.py \
-        --annotations_root ~/.cache/huggingface/datasets/behavior-1k/2025-challenge-demos/annotations \
-        [--output_registry skill_registry.py]
+    python analyze_skill.py \
+        --annotations_root ~/Documents/behavior1k_training_mixed \
+        --output_registry skill_registry_2.py
+
 """
 
 import argparse
@@ -53,6 +54,8 @@ def collect_statistics(annotations_root: Path) -> dict:
         "tasks":        set(),
     })
 
+    episode_skills = defaultdict(set)
+
     annotation_files = sorted(annotations_root.rglob("episode_*.json"))
 
     if not annotation_files:
@@ -79,14 +82,46 @@ def collect_statistics(annotations_root: Path) -> dict:
             skill_id   = skill["skill_id"][0]
             skill_desc = skill.get("skill_description", ["unknown"])
             skill_name = skill_desc[0] if isinstance(skill_desc, list) else skill_desc
+
+            episode_skills[episode_str].add(
+                f"{skill_id}:{skill_name}"
+            )
+            
             f_start, f_end = skill["frame_duration"]
-            num_frames = max(0, f_end - f_start)
+            #num_frames = max(0, f_end - f_start)
+
+            try:
+                num_frames = max(0, f_end - f_start)
+            except Exception:
+                print("\nFILE:", ann_path)
+                print("skill:", skill)
+                print("f_start:", f_start, type(f_start))
+                print("f_end:", f_end, type(f_end))
+                raise
 
             stats[skill_id]["name"]          = skill_name
             stats[skill_id]["total_frames"] += num_frames
             stats[skill_id]["episodes"].add(episode_str)
             stats[skill_id]["tasks"].add(task_str)
 
+    # ----------------------------------------------------
+    # Salvataggio report
+    # ----------------------------------------------------
+
+    report_path = Path("episode_skill_summary.txt")
+
+    with open(report_path, "w") as f:
+
+        for episode in sorted(episode_skills):
+
+            f.write(f"{episode}\n")
+
+            for skill in sorted(episode_skills[episode]):
+                f.write(f"    {skill}\n")
+
+            f.write("\n")
+
+    print(f"Report salvato in: {report_path}")
     return dict(stats)
 
 
@@ -155,6 +190,8 @@ def print_statistics(stats: dict) -> None:
                 f"   Considera di usare class weights nella cross-entropy:\n"
                 f"   weight = total_frames / (num_classes * frames_per_class)\n"
             )
+    
+    
 
 
 # ═════════════════════════════════════════════════════════════════════════════

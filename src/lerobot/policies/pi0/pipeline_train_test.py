@@ -89,6 +89,7 @@ class PI0SkillTrainConfig(TrainPipelineConfig):
     mode: str = "train_val"
     eval_num_batches: int | None = None
     test_num_batches: int | None = None
+    inference_episodes: list[int] | None = None
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SKILL VOCABULARY
@@ -499,7 +500,7 @@ def validate(
     }
 
 # ═════════════════════════════════════════════════════════════════════════════
-# MAIN LOOP
+# BUILD
 # ═════════════════════════════════════════════════════════════════════════════
 def build_everything(cfg, device):
      # ── Dataset ───────────────────────────────────────────────────────────
@@ -518,7 +519,6 @@ def build_everything(cfg, device):
     val_fraction = getattr(cfg.dataset, "val_fraction", 0.15)
     test_fraction = getattr(cfg.dataset, "test_fraction", 0.15)
 
-    # test_eps is preserved for future evaluation (run a separate evaluate.py)
     train_eps, val_eps, test_eps = create_episode_splits(
         num_episodes=num_episodes,
         seed=cfg.seed,
@@ -527,6 +527,10 @@ def build_everything(cfg, device):
         test_fraction=test_fraction,
     )   
 
+    logging.info(f"Train episodes: {sorted(train_eps)}")
+    logging.info(f"Val episodes:   {sorted(val_eps)}")
+    logging.info(f"Test episodes:  {sorted(test_eps)}")
+    
     train_raw = LeRobotDataset(
         repo_id=cfg.dataset.repo_id,
         root=cfg.dataset.root,
@@ -629,10 +633,11 @@ def build_everything(cfg, device):
         dataset_stats=train_raw.meta.stats,
     )
 
-    allocated = torch.cuda.memory_allocated() / 1e9
-    reserved  = torch.cuda.memory_reserved() / 1e9
-    print(f"GPU dopo caricamento modello: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
-    #raise SystemExit("DEBUG STOP")
+    if device.type == "cuda":
+        allocated = torch.cuda.memory_allocated() / 1e9
+        reserved  = torch.cuda.memory_reserved() / 1e9
+        print(f"GPU dopo caricamento modello: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+        #raise SystemExit("DEBUG STOP")
 
     trainable = [(n, p.numel()) for n, p in policy.named_parameters() if p.requires_grad]
     frozen = [(n, p.numel()) for n, p in policy.named_parameters() if not p.requires_grad]
@@ -651,6 +656,101 @@ def build_everything(cfg, device):
         val_loader,
         test_loader,
     )
+
+def build_for_inference(cfg, device, episodes=None):
+    """
+    Versione leggera di build_everything per la sola inference.
+    episodes: lista di indici episodi su cui fare inference.
+              Se None, usa tutti gli episodi del dataset.
+    """
+    dataset_root = Path(cfg.dataset.root).expanduser().resolve()
+    annotations_root = dataset_root / "annotations"
+
+    info = json.load(open(dataset_root / "meta" / "info.json"))
+    num_episodes = info["total_episodes"]
+
+    # Se non specificati, usa tutti gli episodi
+    if episodes is None:
+        episodes = list(range(num_episodes))
+
+    raw_dataset = LeRobotDataset(
+        repo_id=cfg.dataset.repo_id,
+        root=cfg.dataset.root,
+        episodes=episodes,
+        revision="main",
+        force_cache_sync=False,
+    )
+    dataset = SkillLabeledDataset(raw_dataset, annotations_root)
+    loader = DataLoader(
+        dataset,
+        batch_size=cfg.batch_size,
+        shuffle=False,  # ordine temporale importante per la sequenza
+        num_workers=cfg.num_workers,
+        pin_memory=device.type == "cuda",
+    )
+
+    # Carica modello
+    # ... stesso codice di build_everything per policy e preprocessor ...
+
+    # ── Policy ────────────────────────────────────────────────────────────
+    logging.info("Loading PI0 policy...")
+
+    input_features: dict = {}
+    features_meta = raw_dataset.meta.features  # dict chiave → {dtype, shape, ...}
+    for key, feat in features_meta.items():
+        if key.startswith("observation.images"):
+            # Le immagini hanno shape (C, H, W)
+            shape = tuple(feat["shape"])  # es. (3, 480, 640)
+            input_features[key] = PolicyFeature(type=FeatureType.VISUAL, shape=shape)
+        elif key == "observation.state":
+            #shape = tuple(feat["shape"])
+            input_features[key] = PolicyFeature(type=FeatureType.STATE, shape=(28,))
+
+    output_features: dict = {}
+    if "action" in features_meta:
+        shape = tuple(features_meta["action"]["shape"])
+        output_features["action"] = PolicyFeature(type=FeatureType.ACTION, shape=shape)
+
+    logging.info(f"input_features: {list(input_features.keys())}")
+
+    base_policy_cfg = PI0Config()
+    policy_cfg = PI0Config(
+        input_features=input_features,
+        output_features=output_features,
+        **{
+            k: v
+            for k, v in vars(cfg.policy).items()
+            if k not in ( #"classifier_mode", "train_expert_only", "num_subskill_classes",
+                         "input_features", "output_features","max_action_dim") # parametri ignorati se passati nel config
+            and hasattr(base_policy_cfg, k)
+        },
+
+    )
+
+    policy = PI0Policy.from_pretrained(
+        cfg.policy.pretrained_path, #cfg.policy.pretrained_model_name_or_path,
+        config=policy_cfg,
+        strict=False,
+        ignore_mismatched_sizes=True,
+        torch_dtype=torch.bfloat16,
+        #torch_dtype=torch.float16, # pesi caricati in fp16 
+    ).to(device)
+
+    preprocessor, postprocessor = make_pi0_pre_post_processors(
+        config=policy_cfg,
+        dataset_stats=raw_dataset.meta.stats, # VERIFICARE - va bene solo se le statistiche di raw sono le stesse usate per il training (stesso dataset)
+    )
+
+    if device.type == "cuda":
+        allocated = torch.cuda.memory_allocated() / 1e9
+        reserved  = torch.cuda.memory_reserved() / 1e9
+        print(f"GPU dopo caricamento modello: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+
+    return policy, preprocessor, loader
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MAIN LOOP
+# ═════════════════════════════════════════════════════════════════════════════
 
 # ── Train and val ────────────────────────────────────────────────────────
 def train(cfg, mode: str = "train_val") -> None:
@@ -672,13 +772,13 @@ def train(cfg, mode: str = "train_val") -> None:
         wandb.init(
             project=cfg.wandb.project, # getattr(cfg, "wandb_project", "pi0-skill-classifier"),
             name=cfg.job_name or f"pi0-skill-classifier-{cfg.steps}-steps", # getattr(cfg, "wandb_run_name", None),
-            config={
+            config={ # valori visualizzati nella configurazione wandb
                 "num_train_steps": cfg.steps, 
                 "batch_size": cfg.batch_size,
-                #"lr": cfg.optimizer.lr if cfg.optimizer else 2.5e-5, #cfg.optimizer.lr,
+                "lr": cfg.optimizer.lr if cfg.optimizer else 2.5e-5, #cfg.optimizer.lr,
+                # "lr_gemma_expert": 2.5e-6, # differenziati
+                # "lr_classifier": 2.5e-5,
                 "weight_decay": getattr(cfg.optimizer, "weight_decay", 1e-4),
-                "lr_gemma_expert": 2.5e-6,
-                "lr_classifier": 2.5e-5,
                 "grad_clip_norm": cfg.optimizer.grad_clip_norm if cfg.optimizer else 10.0, #cfg.training.grad_clip_norm,
                 "seed": cfg.seed,
                 "device": str(device),
@@ -694,32 +794,33 @@ def train(cfg, mode: str = "train_val") -> None:
     trainable_params = [p for p in policy.parameters() if p.requires_grad]
 
     # LR differenziati
-    backbone_params = []
-    classifier_params = []
-    for name, p in policy.named_parameters():
-        if not p.requires_grad:
-            continue
-        if "classifier_head" in name or "attn_pool" in name:
-            classifier_params.append(p)
-        else:
-            backbone_params.append(p)
-    optimizer = AdamW(
-        [
-            {"params": backbone_params, "lr": 2.5e-6}, # 1e-5
-            {"params": classifier_params, "lr": 2.5e-5}, # 1e-4
-        ],
-        betas=getattr(cfg.optimizer, "betas", (0.9, 0.95)),
-        eps=getattr(cfg.optimizer, "eps", 1e-8),
-        weight_decay=getattr(cfg.optimizer, "weight_decay", 1e-4),
-    )
-
+    # backbone_params = []
+    # classifier_params = []
+    # for name, p in policy.named_parameters():
+    #     if not p.requires_grad:
+    #         continue
+    #     if "classifier_head" in name or "attn_pool" in name:
+    #         classifier_params.append(p)
+    #     else:
+    #         backbone_params.append(p)
     # optimizer = AdamW(
-    #     trainable_params,
-    #     lr=cfg.optimizer.lr if cfg.optimizer else 2.5e-5, #cfg.optimizer.lr, getattr(cfg.optimizer, "lr", 2.5e-5),
+    #     [
+    #         {"params": backbone_params, "lr": 2.5e-6}, # 1e-5
+    #         {"params": classifier_params, "lr": 2.5e-5}, # 1e-4
+    #     ],
     #     betas=getattr(cfg.optimizer, "betas", (0.9, 0.95)),
     #     eps=getattr(cfg.optimizer, "eps", 1e-8),
-    #     weight_decay=getattr(cfg.optimizer, "weight_decay", 1e-4), # Weight decay (originale: 1e-10)
+    #     weight_decay=getattr(cfg.optimizer, "weight_decay", 1e-4),
     # )
+
+    # LR unico
+    optimizer = AdamW(
+        trainable_params,
+        lr=cfg.optimizer.lr if cfg.optimizer else 2.5e-5, #cfg.optimizer.lr, getattr(cfg.optimizer, "lr", 2.5e-5),
+        betas=getattr(cfg.optimizer, "betas", (0.9, 0.95)),
+        eps=getattr(cfg.optimizer, "eps", 1e-8),
+        weight_decay=getattr(cfg.optimizer, "weight_decay", 1e-4), # Weight decay (originale: 1e-10)
+    )
 
     scheduler = CosineAnnealingLR(
         optimizer,
@@ -757,7 +858,7 @@ def train(cfg, mode: str = "train_val") -> None:
     best_val_loss = float("inf")
 
     # ── Early stopping ─────────────────────────────────────────────────────
-    patience = 5  # ferma dopo 5 validazioni senza miglioramento
+    patience = 5  # ferma dopo 5 validazioni senza miglioramento nella loss
     no_improve_count = 0
 
     train_iter = iter(train_loader)
@@ -798,16 +899,16 @@ def train(cfg, mode: str = "train_val") -> None:
             avg_grad = grad_norm_meter.avg
             current_lr = scheduler.get_last_lr()[0]
 
-            lr_gemma = scheduler.get_last_lr()[0] # LR differenziati
-            lr_cls   = scheduler.get_last_lr()[1]
+            # lr_gemma = scheduler.get_last_lr()[0] # LR differenziati
+            # lr_cls   = scheduler.get_last_lr()[1]
             logging.info(
                 f"Step {step:6d}/{cfg.steps} | "
                 f"loss={avg_loss:.4f} | "
                 f"acc={avg_acc:.3f} | "
                 f"grad={avg_grad:.3f} | "
                 f"lr={current_lr:.2e} | "
-                f"lr_gemma={lr_gemma:.2e} | " # LR differenziati
-                f"lr_cls={lr_cls:.2e} | "
+                # f"lr_gemma={lr_gemma:.2e} | " # LR differenziati
+                # f"lr_cls={lr_cls:.2e} | "
                 f"t={step_time_meter.avg:.3f}s"
             )
             # if USE_WANDB:
@@ -820,8 +921,8 @@ def train(cfg, mode: str = "train_val") -> None:
                         "train/lr": current_lr,
                         "train/step_time": step_time_meter.avg,
 
-                        "train/lr_gemma_expert": optimizer.param_groups[0]["lr"], # LR differenziati
-                        "train/lr_classifier":   optimizer.param_groups[1]["lr"],
+                        # "train/lr_gemma_expert": optimizer.param_groups[0]["lr"], # LR differenziati
+                        # "train/lr_classifier":   optimizer.param_groups[1]["lr"],
                     },
                     step=step,
                 )
@@ -1077,6 +1178,399 @@ def run_test(cfg, num_batches: int | None):
     log.info(f"Summary saved: {summary_path}")
 
     return summary
+
+# ═════════════════════════════════════════════════════════════════════════════
+# INFERENCE — segmentazione automatica episodi senza label
+# ═════════════════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def run_inference(cfg, num_batches: int | None = None) -> None:
+    """
+    Inference su episodi senza label (o con label usate solo per confronto).
+
+    Per ogni episodio produce:
+      - sequenza temporale di skill predette frame per frame
+      - sequenza compatta (run-length encoding): [(skill, frame_start, frame_end), ...]
+      - confronto con le annotazioni manuali se disponibili
+      - grafici delle sequenze predette per episodio
+
+    Risultati salvati in output_dir/inference_results/.
+    """
+    set_seed(cfg.seed)
+    device = torch.device(getattr(cfg, "device", "cuda"))
+    output_dir = Path(cfg.output_dir) / "inference_results"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Carica modello ────────────────────────────────────────────────────────
+    # INTEGRAER LA FUNZIONE SOPRA build_for_inference
+    # _, preprocessor, _, _, test_loader = build_everything(cfg, device) 
+
+    best_ckpt_path = Path(cfg.output_dir) / "best_classifier.pt"
+    # if not best_ckpt_path.exists():
+    #     # fallback al final/ se best non esiste
+    #     best_ckpt_path = Path(cfg.output_dir) / "final"
+    #     log.info(f"best_classifier.pt not found, loading from: {best_ckpt_path}")
+
+    log.info(f"Loading checkpoint: {best_ckpt_path}")
+    # ???? policy, preprocessor, _, _, test_loader = build_everything(cfg, device)
+    policy, preprocessor, loader = build_for_inference(
+        cfg,
+        device,
+        #episodes=[0], # [106, 120, 135] numero dell'episodio passato per inferenza
+        episodes=cfg.inference_episodes
+    )
+
+    state_dict = torch.load(best_ckpt_path, map_location="cpu")
+    policy.load_state_dict(state_dict)
+    del state_dict
+    torch.cuda.empty_cache()
+    policy.eval()
+
+    # ── Inference loop ────────────────────────────────────────────────────────
+    # Accumula predizioni per episodio: {ep_idx: [(frame_idx, pred, conf, true_label)]}
+    episode_data: dict[int, list] = {}
+
+    all_preds = [] # cm
+    all_labels = []
+
+    for i, batch in enumerate(loader):
+        if num_batches is not None and i >= num_batches:
+            break
+
+        if i % 100 == 0:
+            log.info(f"  Batch {i} / {len(loader) if num_batches is None else num_batches} ...")
+
+        batch         = move_batch_to_device(batch, device)
+        true_labels   = batch["skill_label"]           # [B] — IGNORE_LABEL se non annotato
+        ep_indices    = batch["episode_index"]          # [B]
+        frame_indices = batch.get("frame_index",
+                        batch.get("index",
+                        torch.zeros(true_labels.shape[0], dtype=torch.long)))
+
+        batch   = preprocessor(batch)
+        batch["observation.state"] = batch["observation.state"][:, :28]
+
+        output          = policy.forward(batch)
+        logits, _, _    = unpack_policy_output(output)
+        preds           = logits.argmax(dim=-1)                         # [B]
+        confidences     = logits.softmax(dim=-1).max(dim=-1).values     # [B]
+
+        valid_mask = true_labels != IGNORE_LABEL
+        if valid_mask.any():
+            all_preds.append(preds[valid_mask].cpu())
+            all_labels.append(true_labels[valid_mask].cpu())
+
+        for ep, fr, pred, conf, true in zip(
+            ep_indices.cpu().tolist(),
+            frame_indices.cpu().tolist(),
+            preds.cpu().tolist(),
+            confidences.cpu().float().tolist(),
+            true_labels.cpu().tolist(),
+        ):
+            if ep not in episode_data:
+                episode_data[ep] = []
+            episode_data[ep].append((int(fr), int(pred), float(conf), int(true)))
+
+    # ── Per ogni episodio: ordina per frame e produce output ──────────────────
+    all_episode_summaries = []
+
+    for ep_idx in sorted(episode_data.keys()):
+        frames = sorted(episode_data[ep_idx], key=lambda x: x[0])  # ordina per frame_idx
+        frame_ids   = [f[0] for f in frames]
+        preds_seq   = [f[1] for f in frames]
+        confs_seq   = [f[2] for f in frames]
+        true_seq    = [f[3] for f in frames]
+
+        # ── Run-length encoding (sequenza compatta) ───────────────────────────
+        # Raggruppa frame consecutivi con la stessa skill predetta
+
+        #preds_smooth = smooth_predictions(preds_seq, window=100) # POST-PROCESSING
+        #rle = _run_length_encode(frame_ids, preds_smooth, confs_seq)
+        ##rle = filter_by_confidence(rle, min_confidence=0.5) # POST-PROCESSING
+
+        rle = _run_length_encode(frame_ids, preds_seq, confs_seq) # NO post-processing
+
+        log.info(f"\nEpisodio {ep_idx:04d} — {len(frames)} frame")
+        log.info(f"  Sequenza predetta (skill, frame_start, frame_end, conf_media):")
+        for skill_cls, f_start, f_end, avg_conf in rle:
+            skill_name = CLASS_TO_SKILL_NAME.get(skill_cls, f"class_{skill_cls}")
+            log.info(f"    [{f_start:5d} → {f_end:5d}]  {skill_name:20s}  conf={avg_conf:.3f}")
+
+        # ── Confronto con annotazioni manuali se disponibili ──────────────────
+        has_labels = any(t != IGNORE_LABEL for t in true_seq)
+        if has_labels:
+            valid = [(p, t) for p, t in zip(preds_seq, true_seq) if t != IGNORE_LABEL]
+            ep_acc = sum(p == t for p, t in valid) / len(valid)
+            log.info(f"  Accuracy vs annotazioni manuali: {ep_acc:.3f} ({len(valid)} frame annotati)")
+        else:
+            ep_acc = None
+            log.info(f"  Nessuna annotazione manuale disponibile")
+
+        # ── Salva sequenza predetta per episodio in JSON ──────────────────────
+        ep_output = {
+            "episode_index": ep_idx,
+            "n_frames": len(frames),
+            "accuracy_vs_manual": ep_acc,
+            "predicted_sequence": [
+                {
+                    "skill": CLASS_TO_SKILL_NAME.get(skill_cls, f"class_{skill_cls}"),
+                    "skill_class": skill_cls,
+                    "frame_start": f_start,
+                    "frame_end": f_end,
+                    "n_frames": f_end - f_start,
+                    "avg_confidence": round(avg_conf, 4),
+                }
+                for skill_cls, f_start, f_end, avg_conf in rle
+            ],
+        }
+        all_episode_summaries.append(ep_output)
+
+        ep_json = output_dir / f"episode_{ep_idx:04d}_inference.json"
+        ep_json.write_text(json.dumps(ep_output, indent=2))
+
+        # ── Plot sequenza temporale ───────────────────────────────────────────
+        _plot_episode_sequence(
+            frame_ids=frame_ids,
+            preds_seq=preds_seq,
+            true_seq=true_seq if has_labels else None,
+            ep_idx=ep_idx,
+            output_path=output_dir / f"episode_{ep_idx:04d}_sequence.png",
+        )
+
+    # ── Salva summary globale ─────────────────────────────────────────────────
+    if len(all_episode_summaries)>1:
+        global_summary = {
+            "n_episodes": len(all_episode_summaries),
+            "episodes": all_episode_summaries,
+        }
+        summary_path = output_dir / "inference_summary.json"
+        summary_path.write_text(json.dumps(global_summary, indent=2))
+
+    
+    # ── Confusion matrix globale su frame annotati ─────────────────────────────
+    if all_labels:
+        all_preds_np = torch.cat(all_preds).numpy()
+        all_labels_np = torch.cat(all_labels).numpy()
+
+        # binomial test per classe DA PROVARE
+        from scipy.stats import binomtest, chi2_contingency
+
+        per_class_tests = {} #
+
+        for class_idx, class_name in CLASS_TO_SKILL_NAME.items():
+            mask = all_labels_np == class_idx
+            n_samples = int(mask.sum())
+
+            if n_samples == 0:
+                continue
+
+            n_correct = int((all_preds_np[mask] == class_idx).sum())
+
+            recall = n_correct / n_samples #
+
+            p_random = n_samples / len(all_labels_np)
+
+            result = binomtest(
+                n_correct,
+                n_samples,
+                p=p_random,
+                alternative="greater",
+            )
+
+            per_class_tests[class_name] = { #
+                "class_idx": int(class_idx),
+                "n_samples": n_samples,
+                "n_correct": n_correct,
+                "recall": float(recall),
+                "p_random": float(p_random),
+                "p_value": float(result.pvalue),
+                "significant_0_05": bool(result.pvalue < 0.05),
+            }
+            
+            log.info(
+                f"{class_name:20s}: recall={n_correct/n_samples:.3f} "
+                f"p-value={result.pvalue:.4g}"
+            )
+        #############
+
+        cm = confusion_matrix(
+            all_labels_np,
+            all_preds_np,
+            labels=list(range(NUM_SKILL_CLASSES)),
+        )
+        plot_confusion_matrix(
+            cm,
+            CLASS_NAMES,
+            output_dir / "inference_confusion_matrix.png",
+        )
+
+        cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True).clip(min=1)
+        plot_confusion_matrix(
+            cm_norm,
+            CLASS_NAMES,
+            output_dir / "inference_confusion_matrix_normalized.png",
+        )
+        
+        ###
+        chi2, chi2_p_value, dof, expected = chi2_contingency(cm)
+
+        log.info(
+            f"Chi-square test: chi2={chi2:.2f}, "
+            f"p-value={chi2_p_value:.4g}, dof={dof}"
+        )
+
+        stats_summary = { # print da provare
+            "chi_square_test": {
+                "chi2": float(chi2),
+                "p_value": float(chi2_p_value),
+                "dof": int(dof),
+            },
+            "per_class_binomial_tests": per_class_tests, #
+        }
+
+        stats_path = output_dir / "inference_statistical_tests.json"
+        stats_path.write_text(json.dumps(stats_summary, indent=2))
+
+        log.info("Inference confusion matrix saved.")
+    else:
+        log.info("No labeled frames found: skipping inference confusion matrix.")
+
+        log.info(f"\nInference completata. Risultati in: {output_dir}")
+
+
+# ── Helpers per inference ─────────────────────────────────────────────────────
+def smooth_predictions(preds, window):
+    """
+    Finestra centrata: guarda window//2 frame prima
+    e window//2 frame dopo il frame corrente.
+    """
+    from collections import Counter
+    half = window // 2
+    smoothed = []
+    for i in range(len(preds)):
+        start = max(0, i - half)
+        end   = min(len(preds), i + half + 1)
+        window_preds = preds[start:end]
+        most_common  = Counter(window_preds).most_common(1)[0][0]
+        smoothed.append(most_common)
+    return smoothed
+
+# def filter_by_confidence(rle, min_confidence=0.5):
+#     """
+#     Rimuove segmenti con confidenza media troppo bassa
+#     e li assegna al segmento precedente.
+#     """
+#     filtered = []
+#     for skill_cls, f_start, f_end, avg_conf in rle:
+#         if avg_conf >= min_confidence:
+#             filtered.append((skill_cls, f_start, f_end, avg_conf))
+#         else:
+#             if filtered:
+#                 prev = filtered[-1]
+#                 filtered[-1] = (prev[0], prev[1], f_end, prev[3])
+#     return filtered
+
+def _run_length_encode(
+    frame_ids: list[int],
+    preds: list[int],
+    confs: list[float],
+) -> list[tuple[int, int, int, float]]:
+    """
+    Comprime la sequenza frame-by-frame in segmenti.
+    Restituisce lista di (skill_class, frame_start, frame_end, avg_confidence).
+    """
+    if not preds:
+        return []
+
+    segments = []
+    cur_skill = preds[0]
+    cur_start = frame_ids[0]
+    cur_confs = [confs[0]]
+
+    for frame, pred, conf in zip(frame_ids[1:], preds[1:], confs[1:]):
+        if pred == cur_skill:
+            cur_confs.append(conf)
+        else:
+            segments.append((cur_skill, cur_start, frame - 1, float(np.mean(cur_confs))))
+            cur_skill = pred
+            cur_start = frame
+            cur_confs = [conf]
+
+    segments.append((cur_skill, cur_start, frame_ids[-1], float(np.mean(cur_confs))))
+    return segments
+
+
+def _plot_episode_sequence(
+    frame_ids: list[int],
+    preds_seq: list[int],
+    true_seq: list[int] | None,
+    ep_idx: int,
+    output_path: Path,
+) -> None:
+    """
+    Produce un grafico a barre colorate che mostra la sequenza di skill
+    predette (e opzionalmente quelle reali) per un episodio.
+
+    Esempio visivo:
+      Frame: 0─────────────────────────────────────────────────────> N
+      Pred:  [move to      ][pick up from][place in  ][move to      ]
+      True:  [move to           ][pick up from  ][place in          ]
+    """
+    # Colore diverso per ogni classe
+    colors = plt.get_cmap("tab10", NUM_SKILL_CLASSES)
+
+    n_rows = 2 if true_seq is not None else 1
+    fig, axes = plt.subplots(n_rows, 1, figsize=(18, 3 * n_rows))
+    if n_rows == 1:
+        axes = [axes]
+
+    for ax, seq, title in zip(
+        axes,
+        [preds_seq] + ([true_seq] if true_seq is not None else []),
+        ["Predicted"] + (["Ground Truth"] if true_seq is not None else []),
+    ):
+        prev_skill = None
+        seg_start  = frame_ids[0]
+
+        for frame, skill in zip(frame_ids, seq):
+            if skill != prev_skill and prev_skill is not None:
+                color = colors(prev_skill % NUM_SKILL_CLASSES) if prev_skill != IGNORE_LABEL else "lightgrey"
+                ax.barh(
+                    0, frame - seg_start, left=seg_start,
+                    color=color, edgecolor="white", height=0.6,
+                )
+                name = CLASS_TO_SKILL_NAME.get(prev_skill, "?") if prev_skill != IGNORE_LABEL else "unlabeled"
+                ax.text(
+                    seg_start + (frame - seg_start) / 2, 0,
+                    name, ha="center", va="center", fontsize=7, color="white", weight="bold",
+                )
+                seg_start = frame
+            prev_skill = skill
+
+        # Ultimo segmento
+        if prev_skill is not None:
+            color = colors(prev_skill % NUM_SKILL_CLASSES) if prev_skill != IGNORE_LABEL else "lightgrey"
+            ax.barh(
+                0, frame_ids[-1] - seg_start + 1, left=seg_start,
+                color=color, edgecolor="white", height=0.6,
+            )
+            name = CLASS_TO_SKILL_NAME.get(prev_skill, "?") if prev_skill != IGNORE_LABEL else "unlabeled"
+            ax.text(
+                seg_start + (frame_ids[-1] - seg_start + 1) / 2, 0,
+                name, ha="center", va="center", fontsize=7, color="white", weight="bold",
+            )
+
+        ax.set_xlim(frame_ids[0], frame_ids[-1] + 1)
+        ax.set_ylim(-0.5, 0.5)
+        ax.set_yticks([])
+        ax.set_xlabel("Frame")
+        ax.set_title(f"Episode {ep_idx:04d} — {title}")
+
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    log.info(f"  Sequence plot saved: {output_path}")
+
 # ═════════════════════════════════════════════════════════════════════════════
 # ENTRYPOINT
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1100,6 +1594,8 @@ if __name__ == "__main__":
         elif mode == "train_val_test":
             train(cfg, mode)
             run_test(cfg, num_batches=test_num_batches)
+        elif mode == "inference":
+            run_inference(cfg, num_batches=None)
         else:
             train(cfg, mode)
     main()
