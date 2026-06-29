@@ -33,6 +33,8 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.utils.logging_utils import AverageMeter
 from lerobot.utils.random_utils import set_seed
 
+from lerobot.datasets.video_utils import FrameTimestampError
+
 #from lerobot.utils.train_utils import (
 from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
@@ -58,15 +60,14 @@ logging.basicConfig(
 
 SKILL_REGISTRY: dict[int, tuple[int, str]] = {
     # skill_id: (class_index, name)
-    1: (0, "move to"),  # 73,882 frame
-    2: (1, "pick up from"),  # 66,453 frame
-    4: (2, "place in"),  # 26,634 frame
-    10: (3, "open door"),  # 10,582 frame
-    3: (4, "place on"),  # 8,291 frame
-    12: (5, "close door"),  # 7,541 frame
-    67: (6, "press"),  # 2,919 frame
-    8:  (7, "toggle off"),
-    90: (8, "push to"),
+    1: (0, "move to"),  # 1,770,229 frame
+    2: (1, "pick up from"),  # 1,121,218 frame
+    4: (2, "place in"),  # 582,636 frame
+    10: (3, "open door"),  # 238,308 frame
+    3: (4, "place on"),  # 154,266 frame
+    12: (5, "close door"),  # 129,016 frame
+    67: (6, "press"),  # 58,120 frame
+    90: (7, "push to"),  # 615 frame
     
 }
 
@@ -140,7 +141,7 @@ class SkillLabeledDataset(Dataset):
         self,
         lerobot_dataset: LeRobotDataset,
         annotations_root: Path,
-        ignore_unlabeled: bool = True,
+        ignore_unlabeled: bool = False,
     ):
         self.dataset = lerobot_dataset
         self.annotations_root = Path(annotations_root)
@@ -151,37 +152,140 @@ class SkillLabeledDataset(Dataset):
                 "Building annotated sample index "
                 "(this may take a few minutes)..."
             )
-            self._valid_indices = self._build_valid_indices()
+            #self._valid_indices = self._build_valid_indices_fast()
+            #self._valid_indices = self._build_valid_indices()
             logging.info(
                 f"Valid samples: {len(self._valid_indices)} / {len(self.dataset)}"
             )
         else:
             self._valid_indices = list(range(len(self.dataset)))
 
-    def _build_valid_indices(self) -> list[int]:
-        """Index only frames that have a valid skill label."""
-        valid = []
-        for i in range(len(self.dataset)):
-            sample    = self.dataset[i]
-            ep_idx    = int(sample["episode_index"])
-            frame_idx = int(sample["frame_index"])
-            labels    = self._get_episode_labels(ep_idx)
-            if labels is not None and labels[frame_idx] != IGNORE_LABEL:
-                valid.append(i)
-        return valid
+    # def _build_valid_indices_fast(self) -> list[int]:
+    #         """
+    #         Costruisce l'indice dei frame validi leggendo solo i JSON
+    #         di annotazione
+    #         """
+    #         valid_indices = []
+
+    #         print("\n[FAST BUILD] costruzione indici validi...")
+
+    #         frame_to_dataset_idx = {}
+    #         for dataset_idx in range(len(self.dataset)):
+    #             row = self.dataset.hf_dataset[dataset_idx]
+    #             ep_idx = int(row["episode_index"])
+    #             # Alcuni dataset hanno frame_index,
+    #             # altri solo index globale
+    #             if "frame_index" in row:
+    #                 frame_idx = int(row["frame_index"])
+    #             else:
+    #                 frame_idx = int(row["index"])
+    #             frame_to_dataset_idx[(ep_idx, frame_idx)] = dataset_idx
+    #             if dataset_idx % 10000 == 0:
+    #                 print(
+    #                     f"[FAST BUILD] indexed "
+    #                     f"{dataset_idx}/{len(self.dataset)}"
+    #                 )
+            # print(
+            #     f"[FAST BUILD] mapping completato "
+            #     f"({len(frame_to_dataset_idx)} frame)"
+            # )
+
+            # skipped_missing = 0
+            # labeled_frames = 0
+            # print("[FAST BUILD] parsing annotazioni...")
+            # for ep_idx, labels in self.labels_by_episode.items():
+            #     if labels is None:
+            #         continue
+            #     for frame_idx, label in enumerate(labels):
+            #         # ignora frame unlabeled
+            #         if self.ignore_unlabeled and label == IGNORE_LABEL:
+            #             continue
+            #         key = (ep_idx, frame_idx)
+            #         if key not in frame_to_dataset_idx:
+            #             skipped_missing += 1
+            #             continue
+            #         dataset_idx = frame_to_dataset_idx[key]
+            #         valid_indices.append(dataset_idx)
+            #         labeled_frames += 1
+            #     print(
+            #         f"[FAST BUILD] episodio {ep_idx} "
+            #         f"-> labels={len(labels)}"
+            #     )
+
+            # print("\n[FAST BUILD] completato")
+            # print(f"[FAST BUILD] valid indices: {len(valid_indices)}")
+            # print(f"[FAST BUILD] labeled frames: {labeled_frames}")
+            # print(f"[FAST BUILD] missing frames: {skipped_missing}")
+
+            # return valid_indices
+    
+    # def _build_valid_indices(self) -> list[int]:
+    #     """Index only frames that have a valid skill label."""
+    #     valid = []
+    #     skipped_frames = []
+
+    #     for i in range(len(self.dataset)):
+    #         if i % 1000 == 0: # debug
+    #             print(f"[build_valid_indices] processed {i}/{len(self.dataset)}")
+    #         #sample    = self.dataset[i]
+
+    #         try:
+    #             sample = self.dataset[i]
+    #         except FrameTimestampError as e:
+    #             print(f"Skipping sample {i}: {e}")
+    #             skipped_frames.append({
+    #                 "sample": i,
+    #                 "episode": ep_idx,
+    #                 "frame": frame_idx,
+    #             })
+    #             continue
+
+    #         ep_idx    = int(sample["episode_index"])
+    #         frame_idx = int(sample["frame_index"])
+    #         labels    = self._get_episode_labels(ep_idx)
+
+    #         # if labels is not None and labels[frame_idx] != IGNORE_LABEL:
+    #         #     valid.append(i)
+
+    #         if labels is not None:
+    #             if frame_idx >= len(labels):
+    #                 continue
+    #             if labels[frame_idx] != IGNORE_LABEL:
+    #                 valid.append(i)
+
+    #     print("Skipped:", len(skipped_frames))
+    #     print(skipped_frames[:20])
+    #     return valid
 
     def _get_episode_labels(self, episode_index: int) -> np.ndarray | None:
         """Load and cache an episode's labels from its annotation JSON."""
+
         if episode_index not in self._label_cache:
-            # BehaviorBot path pattern:
-            # annotations/task-XXXX/episode_XXXXXXXX.json
-            # The first 4 characters of episode_index identify the task.
-            ep_str   = f"{episode_index:08d}"
-            task_str = f"task-{ep_str[:4]}"
-            ann_path = (
-                self.annotations_root / task_str / f"episode_{ep_str}.json"
+            
+            ep_filename = f"episode_{episode_index:08d}.json"
+
+            matches = list(
+                self.annotations_root.rglob(ep_filename)
             )
-            self._label_cache[episode_index] = load_skill_annotation(ann_path)
+
+            if len(matches) == 0:
+                print(
+                    f"[ANNOTATIONS] "
+                    f"annotation NON trovata per "
+                    f"episode {episode_index}"
+                )
+                self._label_cache[episode_index] = None
+
+            else:
+                print(
+                    f"[ANNOTATIONS] "
+                    f"episode {episode_index} -> "
+                    f"{matches[0].name}"
+                )
+                self._label_cache[episode_index] = (
+                    load_skill_annotation(matches[0])
+                )
+
         return self._label_cache[episode_index]
 
     def __len__(self) -> int:
@@ -400,26 +504,86 @@ def train(cfg) -> None:
 
     # Train/val split by episode (90/10 by default)
     num_episodes  = full_dataset.num_episodes
-    val_fraction  = getattr(cfg.dataset, "val_fraction", 0.1) # 0.1 = 10% validation, 90% training
-    num_val_eps   = max(1, int(num_episodes * val_fraction))
-    num_train_eps = num_episodes - num_val_eps
+    
+    # val_fraction  = getattr(cfg.dataset, "val_fraction", 0.1) # 0.1 = 10% validation, 90% training
+    # num_val_eps   = max(1, int(num_episodes * val_fraction))
+    # num_train_eps = num_episodes - num_val_eps
 
     # train_eps     = list(range(num_train_eps))
     # val_eps       = list(range(num_train_eps, num_episodes))
 
+    # rng = np.random.default_rng(cfg.seed)
+
+    # all_eps = np.arange(num_episodes)
+    # rng.shuffle(all_eps)
+
+    # val_eps = all_eps[:num_val_eps].tolist()
+    # train_eps = all_eps[num_val_eps:].tolist()
+
+
+    # logging.info(
+    #     f"Split: {num_train_eps} train episodes, {num_val_eps} val episodes"
+    # )
+
+    train_fraction = 0.7
+    val_fraction   = 0.15
+    test_fraction  = 0.15
+
+    assert abs(train_fraction + val_fraction + test_fraction - 1.0) < 1e-6
 
     rng = np.random.default_rng(cfg.seed)
 
     all_eps = np.arange(num_episodes)
     rng.shuffle(all_eps)
 
-    val_eps = all_eps[:num_val_eps].tolist()
-    train_eps = all_eps[num_val_eps:].tolist()
+    #num_train = int(num_episodes * train_fraction)
+    #num_val   = int(num_episodes * val_fraction)
 
+    num_val = max(1, round(num_episodes * val_fraction))
+    num_test = max(1, round(num_episodes * test_fraction))
+    num_train = num_episodes - num_val - num_test
+
+    train_eps = all_eps[:num_train].tolist()
+
+    val_eps = all_eps[
+        num_train:num_train + num_val
+    ].tolist()
+
+    test_eps = all_eps[
+        num_train + num_val:
+    ].tolist()
 
     logging.info(
-        f"Split: {num_train_eps} train episodes, {num_val_eps} val episodes"
+        f"Split:"
+        f" train={len(train_eps)}"
+        f" val={len(val_eps)}"
+        f" test={len(test_eps)}"
     )
+
+    
+    test_raw = LeRobotDataset(
+        repo_id=cfg.dataset.repo_id,
+        root=cfg.dataset.root,
+        episodes=test_eps,
+        image_transforms=cfg.dataset.image_transforms,
+        delta_timestamps=cfg.dataset.delta_timestamps,
+        video_backend=cfg.dataset.video_backend,
+    )
+
+    test_dataset = SkillLabeledDataset(
+        test_raw,
+        annotations_root,
+        ignore_unlabeled=False,
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        pin_memory=device.type == "cuda",
+    )
+
 
     train_raw = LeRobotDataset(
         repo_id=cfg.dataset.repo_id,
@@ -439,10 +603,10 @@ def train(cfg) -> None:
     )
 
     train_dataset = SkillLabeledDataset(
-        train_raw, annotations_root, ignore_unlabeled=True
+        train_raw, annotations_root, ignore_unlabeled=False
     )
     val_dataset = SkillLabeledDataset(
-        val_raw, annotations_root, ignore_unlabeled=True
+        val_raw, annotations_root, ignore_unlabeled=False
     )
     logging.info(
         f"Annotated samples - train: {len(train_dataset)}, val: {len(val_dataset)}"
@@ -629,9 +793,27 @@ def train(cfg) -> None:
 
     # Final full validation on the entire val set
     logging.info("Running final full validation...")
-    final_val = validate(policy, val_loader, device, num_batches=None)
-    logging.info("Final results:")
+    final_val = validate(
+        policy, 
+        val_loader, 
+        device, 
+        num_batches=None
+    )
+    logging.info("Final validation results:")
     for k, v in final_val.items():
+        logging.info(f"  {k}: {v:.4f}")
+
+
+    logging.info("Running final TEST evaluation...")
+    final_test = validate(
+        policy,
+        test_loader,
+        device,
+        num_batches=None,
+    )
+
+    logging.info("Final TEST results:")
+    for k, v in final_test.items():
         logging.info(f"  {k}: {v:.4f}")
 
 
