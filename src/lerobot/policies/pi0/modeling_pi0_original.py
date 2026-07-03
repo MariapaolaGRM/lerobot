@@ -68,11 +68,6 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
-# def use_state_from_config(config) -> bool:
-#     """Return whether this PI0 variant should consume observation.state."""
-#     return getattr(config, "use_state", True)
-
-
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
     if device_type == "mps" and target_dtype == torch.float64:
@@ -340,6 +335,7 @@ def get_gemma_config(variant: str) -> GemmaConfig:  # see openpi `gemma.py: get_
     else:
         raise ValueError(f"Unknown variant: {variant}")
     
+###############
 class AttentionPooling(nn.Module): 
     def __init__(self, dim):
         super().__init__()
@@ -349,12 +345,12 @@ class AttentionPooling(nn.Module):
 
     def forward(self, x, pad_mask=None):
         # x: [B, T, D]
-        # pad_mask: [B, T] bool, True = real token
+        # pad_mask: [B, T] bool, True = token reale
         q = self.query.expand(x.shape[0], -1, -1)  # [B, 1, D]
         scores = torch.bmm(q, x.transpose(1, 2)) * self.scale  # [B, 1, T]
 
         if pad_mask is not None:
-            # Zero out padding tokens before the softmax
+            # azzera i token di padding prima del softmax
             scores = scores.masked_fill(
                 ~pad_mask.unsqueeze(1),  # [B, 1, T]
                 float('-inf')
@@ -363,7 +359,8 @@ class AttentionPooling(nn.Module):
         weights = torch.softmax(scores, dim=-1)  # [B, 1, T]
         out = torch.bmm(weights, x)              # [B, 1, D]
         return out.squeeze(1)                    # [B, D]
-      
+###############
+#        
 class PaliGemmaWithExpertModel(
     nn.Module
 ):  # see openpi `gemma_pytorch.py: PaliGemmaWithExpertModel` this class is almost a exact copy of PaliGemmaWithExpertModel in openpi
@@ -578,13 +575,13 @@ class PaliGemmaWithExpertModel(
 
         return [prefix_output, suffix_output], prefix_past_key_values
 
+
 class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     """Core PI0 PyTorch model."""
 
     def __init__(self, config: PI0Config, rtc_processor: RTCProcessor | None = None):
         super().__init__()
         self.config = config
-        self.use_state = config.use_state
         self.rtc_processor = rtc_processor
 
         paligemma_config = get_gemma_config(config.paligemma_variant)
@@ -605,18 +602,24 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             train_expert_only=config.train_expert_only,
         )
         
-        
+        ##########
         if not self.config.classifier_mode: # claffifier not active
             self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
             self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
-        else:            
-           
-            classifier_input_dim = 3072 if self.use_state else 2048 # only VLM features
+        else:
+            # self.classifier_head = nn.Sequential(  
+            #     nn.LayerNorm(3072),
+            #     nn.Linear(3072, 1024),
+            #     nn.ReLU(),
+            #     nn.Linear(1024, config.num_subskill_classes),  
+            # )
+            
+            # Alternativa con un layer in più
             self.classifier_head = nn.Sequential(
-                nn.LayerNorm(classifier_input_dim),
-                nn.Linear(classifier_input_dim, 1024),
+                nn.LayerNorm(3072),
+                nn.Linear(3072, 1024),
                 nn.ReLU(),
                 nn.Linear(1024, 512),
                 nn.ReLU(),
@@ -633,10 +636,10 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             # )
         
         self.attn_pool = AttentionPooling(dim=2048) 
-        
+        ##########
 
-        if self.use_state:
-            self.state_proj = nn.Linear(config.max_state_dim, action_expert_config.width)
+        # NO state
+        # self.state_proj = nn.Linear(config.max_state_dim, action_expert_config.width)
         
 
         # Initialize gradient checkpointing flag
@@ -740,39 +743,30 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state=None, noisy_actions=None, timestep=None): ##########
+    def embed_suffix(self, state, noisy_actions=None, timestep=None): ##########
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
         att_masks = []
 
-        bsize = None
-        device = None
+        if self.state_proj.weight.dtype == torch.float32:
+            state = state.to(torch.float32)
 
-        if self.use_state:
-            if state is None:
-                raise ValueError("state is required when config.use_state=True")
+        def state_proj_func(state):
+            return self.state_proj(state)
 
-            if self.state_proj.weight.dtype == torch.float32:
-                state = state.to(torch.float32)
+        state_emb = self._apply_checkpoint(state_proj_func, state)
+        embs.append(state_emb[:, None, :])
+        bsize = state_emb.shape[0]
+        device = state_emb.device
 
-            def state_proj_func(state):
-                return self.state_proj(state)
+        state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
+        pad_masks.append(state_mask)
+        att_masks += [1]
 
-            state_emb = self._apply_checkpoint(state_proj_func, state)
-            embs.append(state_emb[:, None, :])
-            bsize = state_emb.shape[0]
-            device = state_emb.device
-
-            state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
-            pad_masks.append(state_mask)
-            att_masks += [1]
-
+        ##########
         adarms_cond = None
         if not self.config.classifier_mode:
-            if noisy_actions is None or timestep is None:
-                raise ValueError("noisy_actions and timestep are required outside classifier_mode")
-
             # Embed timestep using sine-cosine positional encoding
             time_emb = create_sinusoidal_pos_embedding(
                 timestep,
@@ -802,15 +796,11 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
             embs.append(action_time_emb)
             bsize, action_time_dim = action_time_emb.shape[:2]
-            device = timestep.device
-            action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device)
+            action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=timestep.device)
             pad_masks.append(action_time_mask)
 
-            # Set attention masks so that prefix inputs do not attend to action tokens.
+            # Set attention masks so that image, language and state inputs do not attend to action tokens
             att_masks += [1] + ([0] * (self.config.chunk_size - 1))
-
-        if not embs:
-            raise ValueError("embed_suffix produced no tokens. Disable suffix processing for this mode.")
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -820,12 +810,12 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         return embs, pad_masks, att_masks, adarms_cond
     
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state=None, actions=None, noise=None, time=None, labels=None
+        self, images, img_masks, lang_tokens, lang_masks, state, actions=None, noise=None, time=None, labels=None
     ) -> Tensor:
         """Do a full training forward pass and compute the loss."""
 
+        ##########
         if not self.config.classifier_mode: 
-            # --- Denoising mode ---
             if noise is None:
                 noise = self.sample_noise(actions.shape, actions.device)
 
@@ -835,53 +825,19 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             time_expanded = time[:, None, None]
             x_t = time_expanded * noise + (1 - time_expanded) * actions
             u_t = noise - actions
+        ##########
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks
         )
 
-        if self.config.classifier_mode and not self.use_state: # Ablation
-            # classifier_mode=True, use_state=False
-
-            # Compute the mask only on the prefix
-            prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-            prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-
-            def prefix_forward_func(prefix_embs, prefix_att_2d_masks_4d, prefix_position_ids):
-                (prefix_out, _), _ = self.paligemma_with_expert.forward(
-                    attention_mask=prefix_att_2d_masks_4d,
-                    position_ids=prefix_position_ids,
-                    past_key_values=None,
-                    inputs_embeds=[prefix_embs, None], # Call paligemma_with_expert with prefix_embs only
-                    use_cache=False,
-                    adarms_cond=[None, None],
-                )
-                return prefix_out
-
-            if (
-                self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
-                == torch.bfloat16
-            ):
-                prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
-
-            prefix_out = self._apply_checkpoint(
-                prefix_forward_func, prefix_embs, prefix_att_2d_masks_4d, prefix_position_ids
-            )
-            vlm_feat = self.attn_pool(prefix_out, pad_mask=prefix_pad_masks)
-            logits = self.classifier_head(vlm_feat)
-
-            if labels is None:
-                return logits, None
-
-            loss = F.cross_entropy(logits, labels.long())
-            return logits, loss
-
+        ##########
         #suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
-        if self.config.classifier_mode: #classifier_mode=True, use_state=True
+        if self.config.classifier_mode:
             suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, None, None)
         else:
             suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
+        ##########
         
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -917,11 +873,13 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
         prefix_out, suffix_out = result   # unpacking
 
+        ##########
         if self.config.classifier_mode:
             # classification
+            state_feat = suffix_out[:, 0, :]   # [B, 1024]
+
             vlm_feat = self.attn_pool(prefix_out, pad_mask=prefix_pad_masks)  # [B, 2048]
             # vlm_feat = prefix_out.mean(dim=1)                         # [B, 2048]
-            state_feat = suffix_out[:, 0, :]   # [B, 1024]
             x = torch.cat([vlm_feat, state_feat], dim=-1)             # [B, 3072]
             logits = self.classifier_head(x)  
             
@@ -940,6 +898,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
             return F.mse_loss(u_t, v_t, reduction="none")
+        ##########
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -948,7 +907,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         img_masks,
         lang_tokens,
         lang_masks,
-        state=None,
+        state,
         noise=None,
         num_steps=None,
         **kwargs: Unpack[ActionSelectKwargs],
@@ -957,14 +916,8 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         if num_steps is None:
             num_steps = self.config.num_inference_steps
 
-        if self.use_state:
-            if state is None:
-                raise ValueError("state is required when config.use_state=True")
-            bsize = state.shape[0]
-            device = state.device
-        else:
-            bsize = lang_tokens.shape[0]
-            device = lang_tokens.device
+        bsize = state.shape[0]
+        device = state.device
 
         if noise is None:
             # Sample noise with padded dimension as expected by action_in_proj
@@ -1001,11 +954,11 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
             def denoise_step_partial_call(input_x_t, current_timestep=time_tensor):
                 return self.denoise_step(
+                    state=state,
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     x_t=input_x_t,
                     timestep=current_timestep,
-                    state=state,
                 )
 
             if self._rtc_enabled():
@@ -1033,11 +986,11 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
     def denoise_step(
         self,
+        state,
         prefix_pad_masks,
         past_key_values,
         x_t,
         timestep,
-        state=None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
@@ -1091,7 +1044,6 @@ class PI0Policy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
-        self.use_state = config.use_state
 
         # Initialize the core PI0 model
         self.init_rtc_processor()
@@ -1374,8 +1326,6 @@ class PI0Policy(PreTrainedPolicy):
 
     def prepare_state(self, batch):
         """Pad state"""
-        if not self.use_state:
-            return None
         state = pad_vector(batch[OBS_STATE], self.config.max_state_dim)
         return state
 
@@ -1434,6 +1384,7 @@ class PI0Policy(PreTrainedPolicy):
         lang_tokens, lang_masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         state = self.prepare_state(batch)
 
+        ##########
         if self.config.classifier_mode:
             labels = batch["skill_label"]  # [B]
 
@@ -1444,6 +1395,7 @@ class PI0Policy(PreTrainedPolicy):
             )
             loss_dict = {"loss": loss.item()}
             return logits, loss, loss_dict
+        ##########
 
         actions = self.prepare_action(batch)
         # Compute loss
@@ -1470,10 +1422,9 @@ class PI0Policy(PreTrainedPolicy):
 
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for PI0 fine-tuning."""
-        projection_names = ["action_in_proj", "action_out_proj", "action_time_mlp_in", "action_time_mlp_out"]
-        if self.use_state:
-            projection_names.insert(0, "state_proj")
-        common_projections = "|".join(projection_names)
+        common_projections = (
+            "state_proj|action_in_proj|action_out_proj|action_time_mlp_in|action_time_mlp_out"
+        )
         target_modules = rf"(.*\.gemma_expert\..*\.self_attn\.(q|v)_proj|model\.({common_projections}))"
         return {
             "target_modules": target_modules,

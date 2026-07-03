@@ -88,6 +88,7 @@ class PI0Config(PreTrainedConfig):
 
     classifier_mode: bool = False  # Disable actions, use VLM+state for classification
     num_subskill_classes: int = 34  # For classifier MLP
+    use_state: bool = True # Disable state if False, for ablation test
     
     # Optimizer settings: see openpi `AdamW``
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
@@ -133,7 +134,7 @@ class PI0Config(PreTrainedConfig):
             )
             self.input_features[key] = empty_camera
 
-        if OBS_STATE not in self.input_features:
+        if self.use_state and OBS_STATE not in self.input_features:
             state_feature = PolicyFeature(
                 type=FeatureType.STATE,
                 shape=(self.max_state_dim,),  # Padded to max_state_dim

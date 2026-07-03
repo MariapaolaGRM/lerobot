@@ -1,23 +1,28 @@
 #!/usr/bin/env python
 """
-Training script for the PI0 skill classifier on BehaviorBot 1K.
+Train, evaluate, and run inference for the PI0 skill classifier.
 
-This version keeps the code organized into clear stages:
-- dataset split helper
-- training step
-- validation
-- final test
-- main training loop
+The pipeline builds episode-level train/validation/test splits, wraps the
+LeRobot dataset with frame-wise skill labels, fine-tunes the PI0 classifier
+head, and can report validation/test metrics or run per-episode inference with
+sequence plots.
+
+Supported modes:
+- train: train only
+- train_val: train with periodic validation
+- train_val_test: train, validate, then run the test split
+- test: load a checkpoint and evaluate the test split
+- inference: load a checkpoint and produce per-episode predictions
 
 Usage:
-    python pipeline_train.py 
-        --config_path=/home/mariapaolagerminario/venvs/lerobot/training_config/config.yaml
+    python pipeline_train_test.py
+        --config_path=/home/user/venvs/lerobot/training_config/config.yaml
 """
 
 import os
-os.environ["LEROBOT_VIDEO_TIMESTAMP_TOLERANCE_S"] = "0.1"  # 10x la default
+os.environ["LEROBOT_VIDEO_TIMESTAMP_TOLERANCE_S"] = "0.1"  # 10x the default
 
-import argparse
+# import argparse
 import json
 import logging
 import time
@@ -57,8 +62,6 @@ from lerobot.common.train_utils import (
 import lerobot
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi0.modeling_pi0 import PI0Policy
-
-# from lerobot.policies import make_pre_post_processors # PREPROCESSOR
 from lerobot.policies.pi0.processor_pi0 import make_pi0_pre_post_processors
 
 import lerobot.datasets.video_utils as _vu
@@ -81,9 +84,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# DA PROVARE
 from dataclasses import dataclass 
-
 @dataclass
 class PI0SkillTrainConfig(TrainPipelineConfig):
     mode: str = "train_val"
@@ -91,20 +92,17 @@ class PI0SkillTrainConfig(TrainPipelineConfig):
     test_num_batches: int | None = None
     inference_episodes: list[int] | None = None
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SKILL VOCABULARY
-# ═════════════════════════════════════════════════════════════════════════════
-
+# ── SKILL VOCABULARY ───────────────────────────────────────────────────────────
 SKILL_REGISTRY: dict[int, tuple[int, str]] = {
     # skill_id: (class_index, name)
-    1: (0, "move to"),  # 1,770,229 frame
-    2: (1, "pick up from"),  # 1,121,218 frame
-    4: (2, "place in"),  # 582,636 frame
-    10: (3, "open door"),  # 238,308 frame
-    3: (4, "place on"),  # 154,266 frame
-    12: (5, "close door"),  # 129,016 frame
-    67: (6, "press"),  # 58,120 frame
-    90: (7, "push to"),  # 615 frame
+    1: (0, "move to"),  
+    2: (1, "pick up from"),  
+    4: (2, "place in"), 
+    10: (3, "open door"),  
+    3: (4, "place on"),  
+    12: (5, "close door"),  
+    67: (6, "press"),  
+    90: (7, "push to"),  
 }
 
 SKILL_ID_TO_CLASS = {sid: cls for sid, (cls, _) in SKILL_REGISTRY.items()}
@@ -114,10 +112,7 @@ IGNORE_LABEL = -100
 
 CLASS_NAMES        = [CLASS_TO_SKILL_NAME[i] for i in range(NUM_SKILL_CLASSES)]
 
-# ═════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
-
+# ── HELPERS ───────────────────────────────────────────────────────────
 def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     batch = {
         k: v.to(device) if isinstance(v, torch.Tensor) else v
@@ -155,10 +150,7 @@ def unpack_policy_output(output: Any) -> tuple[torch.Tensor, torch.Tensor | None
         f"Unsupported policy forward output type: {type(output)}"
     )
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# ANNOTATION LOADER
-# ═════════════════════════════════════════════════════════════════════════════
+# ── ANNOTATION LOADER ───────────────────────────────────────────────────────────
 
 def load_skill_annotation(annotation_path: Path) -> np.ndarray | None:
     """Load an episode annotation JSON and return frame-wise skill labels."""
@@ -186,10 +178,7 @@ def load_skill_annotation(annotation_path: Path) -> np.ndarray | None:
 
     return labels
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# DATASET WRAPPER
-# ═════════════════════════════════════════════════════════════════════════════
+# ── DATASET WRAPPER ───────────────────────────────────────────────────────────
 
 class SkillLabeledDataset(Dataset):
     """
@@ -259,18 +248,14 @@ class SkillLabeledDataset(Dataset):
         else:
             skill_label = int(labels[frame_idx])
 
-        sample["skill_label"] = torch.tensor(skill_label, dtype=torch.long) # aggiunge skill
+        sample["skill_label"] = torch.tensor(skill_label, dtype=torch.long) # Add skill
 
         if idx == 0:
             print("Debug sample.keys: ", sample.keys()) 
 
         return sample
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# SPLIT HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
-
+# ── SPLIT HELPERS ───────────────────────────────────────────────────────────
 def create_episode_splits(
     num_episodes: int,
     seed: int,
@@ -327,11 +312,7 @@ def create_episode_splits(
     )
     return train_eps, val_eps, test_eps
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# METRICS
-# ═════════════════════════════════════════════════════════════════════════════
-
+# ── METRICS ───────────────────────────────────────────────────────────
 def compute_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
     valid_mask = labels != IGNORE_LABEL
     if valid_mask.sum() == 0:
@@ -345,7 +326,7 @@ def compute_per_class_accuracy(
     labels: torch.Tensor, 
     already_argmax: bool = False,
 ) -> dict[str, float]:
-    #preds = logits.argmax(dim=-1) # prende classe predetta
+    #preds = logits.argmax(dim=-1) # Get predicted class
 
     preds = logits_or_preds if already_argmax else logits_or_preds.argmax(dim=-1)
     
@@ -373,11 +354,10 @@ def plot_confusion_matrix(cm: np.ndarray, class_names: list[str], output_path: P
     plt.close(fig)
     log.info(f"Confusion matrix saved: {output_path}")
 
-# ═════════════════════════════════════════════════════════════════════════════
-# TRAINING STEP
-# ═════════════════════════════════════════════════════════════════════════════
+# ── TRAINING STEP ───────────────────────────────────────────────────────────
 
 def training_step(
+    cfg,
     policy: PI0Policy,
     batch: dict[str, torch.Tensor],
     optimizer: torch.optim.Optimizer,
@@ -397,8 +377,9 @@ def training_step(
     # PREPROCESSOR
     batch = preprocessor(batch)
 
-    # tronca lo stato ai primi 28 valori
-    batch["observation.state"] = batch["observation.state"][:, :28]
+    if cfg.policy.use_state:
+        # Truncate the state to the first 28 values
+        batch["observation.state"] = batch["observation.state"][:, :28]
 
     ctx = (
         torch.autocast(device_type=device.type, dtype=torch.bfloat16)
@@ -440,13 +421,10 @@ def training_step(
         "grad_norm": grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm),
     }
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# VALIDATION
-# ═════════════════════════════════════════════════════════════════════════════
-
-@torch.no_grad() # disabilita calcolo dei gradienti
+# ── VALIDATION ───────────────────────────────────────────────────────────
+@torch.no_grad() # Disable gradient computation
 def validate(
+    cfg,
     policy: PI0Policy,
     val_loader: DataLoader,
     device: torch.device,
@@ -454,7 +432,7 @@ def validate(
     num_batches: int | None = None,
 ) -> dict[str, float]:
     """Validation loop on val_loader."""
-    policy.eval() # mette il modello in eval mode
+    policy.eval() # Set the model to eval mode
 
     loss_meter = AverageMeter("val_loss")
     acc_meter = AverageMeter("val_accuracy")
@@ -470,8 +448,9 @@ def validate(
         labels = batch["skill_label"]
         batch = preprocessor(batch) # PREPROCESSOR
 
-        # tronca lo stato ai primi 28 valori
-        batch["observation.state"] = batch["observation.state"][:, :28]
+        if cfg.policy.use_state:
+            # Truncate the state to the first 28 values
+            batch["observation.state"] = batch["observation.state"][:, :28]
 
         output = policy.forward(batch)
         logits, loss, _ = unpack_policy_output(output)
@@ -499,9 +478,7 @@ def validate(
         **{f"val/acc_{name}": acc for name, acc in per_class.items()},
     }
 
-# ═════════════════════════════════════════════════════════════════════════════
-# BUILD
-# ═════════════════════════════════════════════════════════════════════════════
+# ── BUILD ───────────────────────────────────────────────────────────
 def build_everything(cfg, device):
      # ── Dataset ───────────────────────────────────────────────────────────
     logging.info("Loading dataset...")
@@ -578,7 +555,7 @@ def build_everything(cfg, device):
     test_loader = DataLoader(
         test_dataset,
         batch_size=cfg.batch_size,
-        shuffle=True, # False per avere sempre gli stessi batch in ogni test 
+        shuffle=True, # False to always get the same batches in each test
         num_workers=cfg.num_workers,
         pin_memory=device.type == "cuda",
     )
@@ -588,14 +565,13 @@ def build_everything(cfg, device):
     logging.info("Loading PI0 policy...")
 
     input_features: dict = {}
-    features_meta = train_raw.meta.features  # dict chiave → {dtype, shape, ...}
+    features_meta = train_raw.meta.features  # key dict -> {dtype, shape, ...}
     for key, feat in features_meta.items():
         if key.startswith("observation.images"):
-            # Le immagini hanno shape (C, H, W)
-            shape = tuple(feat["shape"])  # es. (3, 480, 640)
+            # Images have shape (C, H, W)
+            shape = tuple(feat["shape"])  # e.g. (3, 480, 640)
             input_features[key] = PolicyFeature(type=FeatureType.VISUAL, shape=shape)
-        elif key == "observation.state":
-            #shape = tuple(feat["shape"])
+        elif cfg.policy.use_state and key == "observation.state":
             input_features[key] = PolicyFeature(type=FeatureType.STATE, shape=(28,))
 
     output_features: dict = {}
@@ -612,8 +588,8 @@ def build_everything(cfg, device):
         **{
             k: v
             for k, v in vars(cfg.policy).items()
-            if k not in ( #"classifier_mode", "train_expert_only", "num_subskill_classes",
-                         "input_features", "output_features","max_action_dim") # parametri ignorati se passati nel config
+            if k not in (
+                         "input_features", "output_features","max_action_dim") # Parameters ignored if passed in the config
             and hasattr(base_policy_cfg, k)
         },
 
@@ -625,7 +601,7 @@ def build_everything(cfg, device):
         strict=False,
         ignore_mismatched_sizes=True,
         torch_dtype=torch.bfloat16,
-        #torch_dtype=torch.float16, # pesi caricati in fp16 
+        #torch_dtype=torch.float16, # Weights loaded in fp16
     ).to(device)
 
     preprocessor, postprocessor = make_pi0_pre_post_processors(
@@ -636,7 +612,7 @@ def build_everything(cfg, device):
     if device.type == "cuda":
         allocated = torch.cuda.memory_allocated() / 1e9
         reserved  = torch.cuda.memory_reserved() / 1e9
-        print(f"GPU dopo caricamento modello: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+        print(f"GPU after model loading: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
         #raise SystemExit("DEBUG STOP")
 
     trainable = [(n, p.numel()) for n, p in policy.named_parameters() if p.requires_grad]
@@ -659,9 +635,9 @@ def build_everything(cfg, device):
 
 def build_for_inference(cfg, device, episodes=None):
     """
-    Versione leggera di build_everything per la sola inference.
-    episodes: lista di indici episodi su cui fare inference.
-              Se None, usa tutti gli episodi del dataset.
+    Lightweight version of build_everything for inference only.
+    episodes: list of episode indices to run inference on.
+              If None, use all episodes in the dataset.
     """
     dataset_root = Path(cfg.dataset.root).expanduser().resolve()
     annotations_root = dataset_root / "annotations"
@@ -669,7 +645,7 @@ def build_for_inference(cfg, device, episodes=None):
     info = json.load(open(dataset_root / "meta" / "info.json"))
     num_episodes = info["total_episodes"]
 
-    # Se non specificati, usa tutti gli episodi
+    # If not specified, use all episodes
     if episodes is None:
         episodes = list(range(num_episodes))
 
@@ -684,26 +660,22 @@ def build_for_inference(cfg, device, episodes=None):
     loader = DataLoader(
         dataset,
         batch_size=cfg.batch_size,
-        shuffle=False,  # ordine temporale importante per la sequenza
+        shuffle=False,  # Temporal order is important for the sequence
         num_workers=cfg.num_workers,
         pin_memory=device.type == "cuda",
     )
-
-    # Carica modello
-    # ... stesso codice di build_everything per policy e preprocessor ...
 
     # ── Policy ────────────────────────────────────────────────────────────
     logging.info("Loading PI0 policy...")
 
     input_features: dict = {}
-    features_meta = raw_dataset.meta.features  # dict chiave → {dtype, shape, ...}
+    features_meta = raw_dataset.meta.features  # key dict -> {dtype, shape, ...}
     for key, feat in features_meta.items():
         if key.startswith("observation.images"):
-            # Le immagini hanno shape (C, H, W)
-            shape = tuple(feat["shape"])  # es. (3, 480, 640)
+            # Images have shape (C, H, W)
+            shape = tuple(feat["shape"])  # e.g. (3, 480, 640)
             input_features[key] = PolicyFeature(type=FeatureType.VISUAL, shape=shape)
-        elif key == "observation.state":
-            #shape = tuple(feat["shape"])
+        elif cfg.policy.use_state and key == "observation.state":
             input_features[key] = PolicyFeature(type=FeatureType.STATE, shape=(28,))
 
     output_features: dict = {}
@@ -720,8 +692,8 @@ def build_for_inference(cfg, device, episodes=None):
         **{
             k: v
             for k, v in vars(cfg.policy).items()
-            if k not in ( #"classifier_mode", "train_expert_only", "num_subskill_classes",
-                         "input_features", "output_features","max_action_dim") # parametri ignorati se passati nel config
+            if k not in (
+                         "input_features", "output_features","max_action_dim") # Parameters ignored if passed in the config
             and hasattr(base_policy_cfg, k)
         },
 
@@ -733,26 +705,22 @@ def build_for_inference(cfg, device, episodes=None):
         strict=False,
         ignore_mismatched_sizes=True,
         torch_dtype=torch.bfloat16,
-        #torch_dtype=torch.float16, # pesi caricati in fp16 
+        #torch_dtype=torch.float16, # Weights loaded in fp16
     ).to(device)
 
     preprocessor, postprocessor = make_pi0_pre_post_processors(
         config=policy_cfg,
-        dataset_stats=raw_dataset.meta.stats, # VERIFICARE - va bene solo se le statistiche di raw sono le stesse usate per il training (stesso dataset)
+        dataset_stats=raw_dataset.meta.stats, # VERIFY - OK only if raw stats are the same as those used for training (same dataset)
     )
 
     if device.type == "cuda":
         allocated = torch.cuda.memory_allocated() / 1e9
         reserved  = torch.cuda.memory_reserved() / 1e9
-        print(f"GPU dopo caricamento modello: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+        print(f"GPU after model loading: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
 
     return policy, preprocessor, loader
 
-# ═════════════════════════════════════════════════════════════════════════════
-# MAIN LOOP
-# ═════════════════════════════════════════════════════════════════════════════
-
-# ── Train and val ────────────────────────────────────────────────────────
+# ── TRAINING AND VALIDATION ────────────────────────────────────────────────────────
 def train(cfg, mode: str = "train_val") -> None:
     """Main training loop.
 
@@ -813,13 +781,13 @@ def train(cfg, mode: str = "train_val") -> None:
     #     weight_decay=getattr(cfg.optimizer, "weight_decay", 1e-4),
     # )
 
-    # LR unico
+    # Single LR
     optimizer = AdamW(
         trainable_params,
         lr=cfg.optimizer.lr if cfg.optimizer else 2.5e-5, #cfg.optimizer.lr, getattr(cfg.optimizer, "lr", 2.5e-5),
         betas=getattr(cfg.optimizer, "betas", (0.9, 0.95)),
         eps=getattr(cfg.optimizer, "eps", 1e-8),
-        weight_decay=getattr(cfg.optimizer, "weight_decay", 1e-4), # Weight decay (originale: 1e-10)
+        weight_decay=getattr(cfg.optimizer, "weight_decay", 1e-4), # Weight decay (original: 1e-10)
     )
 
     scheduler = CosineAnnealingLR(
@@ -830,8 +798,8 @@ def train(cfg, mode: str = "train_val") -> None:
 
     use_amp = device.type == "cuda"
 
-    #scaler = torch.amp.GradScaler("cuda") if use_amp else None # con float16
-    scaler = None # con bfloat16
+    #scaler = torch.amp.GradScaler("cuda") if use_amp else None # with float16
+    scaler = None # with bfloat16
     
     if use_amp:
         logging.info("AMP enabled")
@@ -858,7 +826,7 @@ def train(cfg, mode: str = "train_val") -> None:
     best_val_loss = float("inf")
 
     # ── Early stopping ─────────────────────────────────────────────────────
-    patience = 5  # ferma dopo 5 validazioni senza miglioramento nella loss
+    patience = 5  # Stop after 5 validations without loss improvement
     no_improve_count = 0
 
     train_iter = iter(train_loader)
@@ -873,6 +841,7 @@ def train(cfg, mode: str = "train_val") -> None:
         t_start = time.perf_counter()
 
         metrics = training_step(
+            cfg,
             policy=policy,
             batch=batch,
             optimizer=optimizer,
@@ -911,7 +880,6 @@ def train(cfg, mode: str = "train_val") -> None:
                 # f"lr_cls={lr_cls:.2e} | "
                 f"t={step_time_meter.avg:.3f}s"
             )
-            # if USE_WANDB:
             if wandb_enabled:   
                 wandb.log(
                     {
@@ -936,6 +904,7 @@ def train(cfg, mode: str = "train_val") -> None:
             t_val_start = time.perf_counter()
 
             val_metrics = validate(
+                cfg,
                 policy=policy,
                 val_loader=val_loader,
                 device=device,
@@ -944,16 +913,15 @@ def train(cfg, mode: str = "train_val") -> None:
             )
 
             val_time=time.perf_counter()-t_val_start
-            val_metrics["val/time_s"] = val_time  # aggiunge il tempo al dizionario
+            val_metrics["val/time_s"] = val_time  # Add time to the dictionary
 
             val_summary = " | ".join(f"{k}={v:.4f}" for k, v in val_metrics.items())
             logging.info(f"Step {step:6d} [VAL] {val_summary}")
             
-            # if USE_WANDB: 
             if wandb_enabled: 
                 wandb.log(val_metrics, step=step)
 
-            # Salva il miglior checkpoint se la val loss migliora (tutti i pesi del modello)
+            # Save the best checkpoint if val loss improves (all model weights)
             if val_metrics["val/loss"] < best_val_loss: # - min_delta:
                 # Early stopping
                 no_improve_count = 0
@@ -961,7 +929,7 @@ def train(cfg, mode: str = "train_val") -> None:
                 best_val_loss = val_metrics["val/loss"]
                 best_path = output_dir / "best_classifier.pt"
                 torch.save(policy.state_dict(), best_path)
-                logging.info(f"Best model aggiornato (val/loss={best_val_loss:.4f}): {best_path}")
+                logging.info(f"Best model updated (val/loss={best_val_loss:.4f}): {best_path}")
             else: # Early stopping
                 no_improve_count += 1
                 logging.info(f"No improvement: {no_improve_count}/{patience}")
@@ -990,7 +958,7 @@ def train(cfg, mode: str = "train_val") -> None:
             update_last_checkpoint(ckpt_dir)
             logging.info(f"Checkpoint saved: {ckpt_dir}")
 
-            # Cancella il checkpoint precedente
+            # ── Delete the previous checkpoint ─────────────────────────────────────────────
             prev_step = step - cfg.save_freq
             if prev_step > 0:
                 prev_ckpt_dir = get_step_checkpoint_dir(
@@ -1009,10 +977,10 @@ def train(cfg, mode: str = "train_val") -> None:
         logging.info(f"Loading best checkpoint for final evaluation: {best_ckpt_path}")
         # policy.load_state_dict(torch.load(best_ckpt_path, map_location=device))
 
-        # ALTERNATIVA
-        state_dict = torch.load(best_ckpt_path, map_location="cpu") # carica tensori temporaneamente in RAM (alloca memoria)
-        policy.load_state_dict(state_dict) # copia pesi nel modello in GPU
-        del state_dict # elimina riferimento python dal dizionario temporaneo
+        # ALTERNATIVE
+        state_dict = torch.load(best_ckpt_path, map_location="cpu") # Temporarily load tensors into RAM (allocates memory)
+        policy.load_state_dict(state_dict) # Copy weights into the model on GPU
+        del state_dict # Delete the Python reference to the temporary dictionary
 
     # ── Final model saving ────────────────────────────────────────────────
     final_dir = output_dir / "final"
@@ -1023,24 +991,22 @@ def train(cfg, mode: str = "train_val") -> None:
     # ── Final validation (skipped in 'train' mode) ───────────────────────
     if mode in ("train_val", "train_val_test"):
         logging.info("Running final full validation...")
-        final_val = validate(policy, val_loader, device, preprocessor=preprocessor, num_batches=5000)
+        final_val = validate(cfg, policy, val_loader, device, preprocessor=preprocessor, num_batches=5000)
         logging.info("Final validation results:")
         for k, v in final_val.items():
             logging.info(f"  {k}: {v:.4f}")
-        #if USE_WANDB:
         if wandb_enabled: 
             wandb.log({f"final/{k}": v for k, v in final_val.items()})
     else:
         logging.info("Skipping final validation (mode='train').")
 
     # ── W&B finish ────────────────────────────────────────────────────────
-    # if USE_WANDB:
     if wandb_enabled: 
         wandb.finish()
     logging.info("Training complete.")
 
 
-# ── Test ────────────────────────────────────────────────────────
+# ── TEST ────────────────────────────────────────────────────────
 @torch.no_grad()
 def run_test(cfg, num_batches: int | None):
     set_seed(cfg.seed)
@@ -1067,7 +1033,7 @@ def run_test(cfg, num_batches: int | None):
 
     policy.eval()
 
-    # ── Inference loop ────────────────────────────────────────────────────────
+    # ── Test loop ────────────────────────────────────────────────────────
     all_preds  = []
     all_labels = []
     total_loss = 0.0
@@ -1083,7 +1049,9 @@ def run_test(cfg, num_batches: int | None):
         batch  = move_batch_to_device(batch, device)
         labels = batch["skill_label"]
         batch  = preprocessor(batch)
-        batch["observation.state"] = batch["observation.state"][:, :28]
+
+        if cfg.policy.use_state:
+            batch["observation.state"] = batch["observation.state"][:, :28]
 
         output         = policy.forward(batch)
         logits, loss, _ = unpack_policy_output(output)
@@ -1097,7 +1065,7 @@ def run_test(cfg, num_batches: int | None):
             n_valid_total += n_valid
 
         preds = logits.argmax(dim=-1)
-        # Tieni solo sample con label valida
+        # Keep only samples with valid labels
         all_preds.append(preds[valid_mask].cpu())
         all_labels.append(labels[valid_mask].cpu())
 
@@ -1113,15 +1081,6 @@ def run_test(cfg, num_batches: int | None):
     log.info(f"{'='*50}\n")
 
     # ── Per-class accuracy ────────────────────────────────────────────────────
-    # log.info("Per-class accuracy:")
-    # for c, name in CLASS_TO_SKILL_NAME.items():
-    #     mask = all_labels == c
-    #     if mask.sum() == 0:
-    #         log.info(f"  {name:20s}  — no samples")
-    #         continue
-    #     acc = (all_preds[mask] == c).mean()
-    #     log.info(f"  {name:20s}  {acc:.3f}  ({mask.sum()} samples)")
-    
     log.info("Per-class accuracy:")
     preds_tensor = torch.from_numpy(all_preds)
     labels_tensor = torch.from_numpy(all_labels)
@@ -1129,13 +1088,6 @@ def run_test(cfg, num_batches: int | None):
 
     for name, acc in per_class.items():
         log.info(f"  {name:20s}  {acc:.3f}")
-    # for c, name in CLASS_TO_SKILL_NAME.items():
-    #     mask = all_labels == c
-    #     if mask.sum() == 0:
-    #         log.info(f"  {name:20s}  — no samples")
-    #         continue
-    #     acc = per_class[name]
-    #     log.info(f"  {name:20s}  {acc:.3f}  ({mask.sum()} samples)")
 
     # ── Classification report ─────────────────────────────────────────────────
     report = classification_report(
@@ -1154,21 +1106,16 @@ def run_test(cfg, num_batches: int | None):
     cm = confusion_matrix(all_labels, all_preds, labels=list(range(NUM_SKILL_CLASSES)))
     plot_confusion_matrix(cm, CLASS_NAMES, output_dir / f"confusion_matrix.png")
 
-    # Normalizzata (per riga) — utile con classi sbilanciate
+    # Normalized (row-wise) - useful with imbalanced classes
     cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True).clip(min=1)
     plot_confusion_matrix(cm_norm, CLASS_NAMES, output_dir / f"confusion_matrix_normalized.png")
 
-    # ── Salva summary JSON ────────────────────────────────────────────────────
+    # ── Save summary JSON ─────────────────────────────────────────────────────
     summary = {
         "n_samples": int(len(all_labels)),
         "loss": float(avg_loss),
         "accuracy": float(accuracy),
-        "per_class_accuracy_before": {
-            CLASS_TO_SKILL_NAME[c]: float((all_preds[all_labels == c] == c).mean())
-            if (all_labels == c).sum() > 0 else None
-            for c in range(NUM_SKILL_CLASSES)
-        },
-        "per_class_accuracy": {
+        "per_class_accuracy": { 
             CLASS_TO_SKILL_NAME[c]: per_class.get(CLASS_TO_SKILL_NAME[c])
             for c in range(NUM_SKILL_CLASSES)
         },
@@ -1179,35 +1126,34 @@ def run_test(cfg, num_batches: int | None):
 
     return summary
 
-# ═════════════════════════════════════════════════════════════════════════════
-# INFERENCE — segmentazione automatica episodi senza label
-# ═════════════════════════════════════════════════════════════════════════════
+# ── INFERENCE ───────────────────────────────────────────────────────────
+# automatic segmentation of unlabeled episodes
 
 @torch.no_grad()
 def run_inference(cfg, num_batches: int | None = None) -> None:
     """
-    Inference su episodi senza label (o con label usate solo per confronto).
+    Inference on unlabeled episodes (or with labels used only for comparison).
 
-    Per ogni episodio produce:
-      - sequenza temporale di skill predette frame per frame
-      - sequenza compatta (run-length encoding): [(skill, frame_start, frame_end), ...]
-      - confronto con le annotazioni manuali se disponibili
-      - grafici delle sequenze predette per episodio
+    For each episode, produces:
+      - temporal sequence of predicted skills frame by frame
+      - compact sequence (run-length encoding): [(skill, frame_start, frame_end), ...]
+      - comparison with manual annotations if available
+      - plots of predicted sequences for each episode
 
-    Risultati salvati in output_dir/inference_results/.
+    Results are saved in output_dir/inference_results/.
     """
     set_seed(cfg.seed)
     device = torch.device(getattr(cfg, "device", "cuda"))
     output_dir = Path(cfg.output_dir) / "inference_results"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Carica modello ────────────────────────────────────────────────────────
-    # INTEGRAER LA FUNZIONE SOPRA build_for_inference
+    # ── Load model ────────────────────────────────────────────────────────────
+    # INTEGRATE THE build_for_inference FUNCTION ABOVE
     # _, preprocessor, _, _, test_loader = build_everything(cfg, device) 
 
     best_ckpt_path = Path(cfg.output_dir) / "best_classifier.pt"
     # if not best_ckpt_path.exists():
-    #     # fallback al final/ se best non esiste
+    #     # fallback to final/ if best does not exist
     #     best_ckpt_path = Path(cfg.output_dir) / "final"
     #     log.info(f"best_classifier.pt not found, loading from: {best_ckpt_path}")
 
@@ -1216,7 +1162,7 @@ def run_inference(cfg, num_batches: int | None = None) -> None:
     policy, preprocessor, loader = build_for_inference(
         cfg,
         device,
-        #episodes=[0], # [106, 120, 135] numero dell'episodio passato per inferenza
+        #episodes=[0], # [106, 120, 135] episode number passed for inference
         episodes=cfg.inference_episodes
     )
 
@@ -1227,7 +1173,7 @@ def run_inference(cfg, num_batches: int | None = None) -> None:
     policy.eval()
 
     # ── Inference loop ────────────────────────────────────────────────────────
-    # Accumula predizioni per episodio: {ep_idx: [(frame_idx, pred, conf, true_label)]}
+    # Accumulate predictions by episode: {ep_idx: [(frame_idx, pred, conf, true_label)]}
     episode_data: dict[int, list] = {}
 
     all_preds = [] # cm
@@ -1241,14 +1187,15 @@ def run_inference(cfg, num_batches: int | None = None) -> None:
             log.info(f"  Batch {i} / {len(loader) if num_batches is None else num_batches} ...")
 
         batch         = move_batch_to_device(batch, device)
-        true_labels   = batch["skill_label"]           # [B] — IGNORE_LABEL se non annotato
+        true_labels   = batch["skill_label"]           # [B] - IGNORE_LABEL if not annotated
         ep_indices    = batch["episode_index"]          # [B]
         frame_indices = batch.get("frame_index",
                         batch.get("index",
                         torch.zeros(true_labels.shape[0], dtype=torch.long)))
 
         batch   = preprocessor(batch)
-        batch["observation.state"] = batch["observation.state"][:, :28]
+        if cfg.policy.use_state:
+            batch["observation.state"] = batch["observation.state"][:, :28]
 
         output          = policy.forward(batch)
         logits, _, _    = unpack_policy_output(output)
@@ -1271,18 +1218,18 @@ def run_inference(cfg, num_batches: int | None = None) -> None:
                 episode_data[ep] = []
             episode_data[ep].append((int(fr), int(pred), float(conf), int(true)))
 
-    # ── Per ogni episodio: ordina per frame e produce output ──────────────────
+    # ── For each episode: sort by frame and produce output ────────────────────
     all_episode_summaries = []
 
     for ep_idx in sorted(episode_data.keys()):
-        frames = sorted(episode_data[ep_idx], key=lambda x: x[0])  # ordina per frame_idx
+        frames = sorted(episode_data[ep_idx], key=lambda x: x[0])  # Sort by frame_idx
         frame_ids   = [f[0] for f in frames]
         preds_seq   = [f[1] for f in frames]
         confs_seq   = [f[2] for f in frames]
         true_seq    = [f[3] for f in frames]
 
-        # ── Run-length encoding (sequenza compatta) ───────────────────────────
-        # Raggruppa frame consecutivi con la stessa skill predetta
+        # ── Run-length encoding (compact sequence) ────────────────────────────
+        # Group consecutive frames with the same predicted skill
 
         #preds_smooth = smooth_predictions(preds_seq, window=100) # POST-PROCESSING
         #rle = _run_length_encode(frame_ids, preds_smooth, confs_seq)
@@ -1290,23 +1237,23 @@ def run_inference(cfg, num_batches: int | None = None) -> None:
 
         rle = _run_length_encode(frame_ids, preds_seq, confs_seq) # NO post-processing
 
-        log.info(f"\nEpisodio {ep_idx:04d} — {len(frames)} frame")
-        log.info(f"  Sequenza predetta (skill, frame_start, frame_end, conf_media):")
+        log.info(f"\nEpisode {ep_idx:04d} — {len(frames)} frames")
+        log.info(f"  Predicted sequence (skill, frame_start, frame_end, avg_conf):")
         for skill_cls, f_start, f_end, avg_conf in rle:
             skill_name = CLASS_TO_SKILL_NAME.get(skill_cls, f"class_{skill_cls}")
             log.info(f"    [{f_start:5d} → {f_end:5d}]  {skill_name:20s}  conf={avg_conf:.3f}")
 
-        # ── Confronto con annotazioni manuali se disponibili ──────────────────
+        # ── Comparison with manual annotations if available ───────────────────
         has_labels = any(t != IGNORE_LABEL for t in true_seq)
         if has_labels:
             valid = [(p, t) for p, t in zip(preds_seq, true_seq) if t != IGNORE_LABEL]
             ep_acc = sum(p == t for p, t in valid) / len(valid)
-            log.info(f"  Accuracy vs annotazioni manuali: {ep_acc:.3f} ({len(valid)} frame annotati)")
+            log.info(f"  Accuracy vs manual annotations: {ep_acc:.3f} ({len(valid)} annotated frames)")
         else:
             ep_acc = None
-            log.info(f"  Nessuna annotazione manuale disponibile")
+            log.info(f"  No manual annotations available")
 
-        # ── Salva sequenza predetta per episodio in JSON ──────────────────────
+        # ── Save predicted sequence for each episode as JSON ──────────────────
         ep_output = {
             "episode_index": ep_idx,
             "n_frames": len(frames),
@@ -1328,7 +1275,7 @@ def run_inference(cfg, num_batches: int | None = None) -> None:
         ep_json = output_dir / f"episode_{ep_idx:04d}_inference.json"
         ep_json.write_text(json.dumps(ep_output, indent=2))
 
-        # ── Plot sequenza temporale ───────────────────────────────────────────
+        # ── Plot temporal sequence ────────────────────────────────────────────
         _plot_episode_sequence(
             frame_ids=frame_ids,
             preds_seq=preds_seq,
@@ -1337,7 +1284,7 @@ def run_inference(cfg, num_batches: int | None = None) -> None:
             output_path=output_dir / f"episode_{ep_idx:04d}_sequence.png",
         )
 
-    # ── Salva summary globale ─────────────────────────────────────────────────
+    # ── Save global summary ───────────────────────────────────────────────────
     if len(all_episode_summaries)>1:
         global_summary = {
             "n_episodes": len(all_episode_summaries),
@@ -1347,12 +1294,12 @@ def run_inference(cfg, num_batches: int | None = None) -> None:
         summary_path.write_text(json.dumps(global_summary, indent=2))
 
     
-    # ── Confusion matrix globale su frame annotati ─────────────────────────────
+    # ── Global confusion matrix on annotated frames ───────────────────────────
     if all_labels:
         all_preds_np = torch.cat(all_preds).numpy()
         all_labels_np = torch.cat(all_labels).numpy()
 
-        # binomial test per classe DA PROVARE
+        # Per-class binomial test 
         from scipy.stats import binomtest, chi2_contingency
 
         per_class_tests = {} #
@@ -1391,7 +1338,20 @@ def run_inference(cfg, num_batches: int | None = None) -> None:
                 f"{class_name:20s}: recall={n_correct/n_samples:.3f} "
                 f"p-value={result.pvalue:.4g}"
             )
-        #############
+        
+        # ── Classification report ─────────────────────────────────────────────────
+        report = classification_report(
+            all_labels_np, all_preds_np,
+            labels=list(range(NUM_SKILL_CLASSES)),
+            target_names=CLASS_NAMES,
+            zero_division=0,
+        )
+        log.info(f"\nClassification report:\n{report}")
+
+        report_path = output_dir / f"classification_report_inference.txt"
+        report_path.write_text(report)
+        log.info(f"Classification report saved: {report_path}")
+        #####
 
         cm = confusion_matrix(
             all_labels_np,
@@ -1412,21 +1372,47 @@ def run_inference(cfg, num_batches: int | None = None) -> None:
         )
         
         ###
-        chi2, chi2_p_value, dof, expected = chi2_contingency(cm)
+        #chi2, chi2_p_value, dof, expected = chi2_contingency(cm)
+
+        row_sums = cm.sum(axis=1)
+        col_sums = cm.sum(axis=0)
+
+        valid_classes = (row_sums > 0) & (col_sums > 0)
+        cm_for_chi2 = cm[valid_classes][:, valid_classes]
+
+        if cm_for_chi2.shape[0] >= 2:
+            chi2, chi2_p_value, dof, expected = chi2_contingency(cm_for_chi2)
+
+            log.info(
+                f"Chi-square test: chi2={chi2:.2f}, "
+                f"p-value={chi2_p_value:.4g}, dof={dof}"
+            )
+        else:
+            chi2 = None
+            chi2_p_value = None
+            dof = None
+            log.warning("Chi-square test skipped: not enough non-empty classes.")
 
         log.info(
             f"Chi-square test: chi2={chi2:.2f}, "
             f"p-value={chi2_p_value:.4g}, dof={dof}"
         )
 
-        stats_summary = { # print da provare
+        stats_summary = { 
             "chi_square_test": {
-                "chi2": float(chi2),
-                "p_value": float(chi2_p_value),
-                "dof": int(dof),
+                "chi2": float(chi2) if chi2 is not None else None,
+                "p_value": float(chi2_p_value) if chi2_p_value is not None else None,
+                "dof": int(dof) if dof is not None else None,
+                "used_classes": [
+                    CLASS_TO_SKILL_NAME[i]
+                    for i, keep in enumerate(valid_classes)
+                    if keep
+                ],
             },
             "per_class_binomial_tests": per_class_tests, #
         }
+        
+        ###
 
         stats_path = output_dir / "inference_statistical_tests.json"
         stats_path.write_text(json.dumps(stats_summary, indent=2))
@@ -1435,40 +1421,25 @@ def run_inference(cfg, num_batches: int | None = None) -> None:
     else:
         log.info("No labeled frames found: skipping inference confusion matrix.")
 
-        log.info(f"\nInference completata. Risultati in: {output_dir}")
+        log.info(f"\nInference completed. Results in: {output_dir}")
 
 
-# ── Helpers per inference ─────────────────────────────────────────────────────
-def smooth_predictions(preds, window):
-    """
-    Finestra centrata: guarda window//2 frame prima
-    e window//2 frame dopo il frame corrente.
-    """
-    from collections import Counter
-    half = window // 2
-    smoothed = []
-    for i in range(len(preds)):
-        start = max(0, i - half)
-        end   = min(len(preds), i + half + 1)
-        window_preds = preds[start:end]
-        most_common  = Counter(window_preds).most_common(1)[0][0]
-        smoothed.append(most_common)
-    return smoothed
-
-# def filter_by_confidence(rle, min_confidence=0.5):
+# ── Inference helpers ─────────────────────────────────────────────────────────
+# def smooth_predictions(preds, window):
 #     """
-#     Rimuove segmenti con confidenza media troppo bassa
-#     e li assegna al segmento precedente.
+#     Centered window: look at window//2 frames before
+#     and window//2 frames after the current frame.
 #     """
-#     filtered = []
-#     for skill_cls, f_start, f_end, avg_conf in rle:
-#         if avg_conf >= min_confidence:
-#             filtered.append((skill_cls, f_start, f_end, avg_conf))
-#         else:
-#             if filtered:
-#                 prev = filtered[-1]
-#                 filtered[-1] = (prev[0], prev[1], f_end, prev[3])
-#     return filtered
+#     from collections import Counter
+#     half = window // 2
+#     smoothed = []
+#     for i in range(len(preds)):
+#         start = max(0, i - half)
+#         end   = min(len(preds), i + half + 1)
+#         window_preds = preds[start:end]
+#         most_common  = Counter(window_preds).most_common(1)[0][0]
+#         smoothed.append(most_common)
+#     return smoothed
 
 def _run_length_encode(
     frame_ids: list[int],
@@ -1476,8 +1447,8 @@ def _run_length_encode(
     confs: list[float],
 ) -> list[tuple[int, int, int, float]]:
     """
-    Comprime la sequenza frame-by-frame in segmenti.
-    Restituisce lista di (skill_class, frame_start, frame_end, avg_confidence).
+    Compress the frame-by-frame sequence into segments.
+    Return a list of (skill_class, frame_start, frame_end, avg_confidence).
     """
     if not preds:
         return []
@@ -1508,15 +1479,15 @@ def _plot_episode_sequence(
     output_path: Path,
 ) -> None:
     """
-    Produce un grafico a barre colorate che mostra la sequenza di skill
-    predette (e opzionalmente quelle reali) per un episodio.
+    Produce a colored bar chart that shows the sequence of predicted skills
+    (and optionally the ground-truth skills) for one episode.
 
-    Esempio visivo:
+    Visual example:
       Frame: 0─────────────────────────────────────────────────────> N
       Pred:  [move to      ][pick up from][place in  ][move to      ]
       True:  [move to           ][pick up from  ][place in          ]
     """
-    # Colore diverso per ogni classe
+    # Different color for each class
     colors = plt.get_cmap("tab10", NUM_SKILL_CLASSES)
 
     n_rows = 2 if true_seq is not None else 1
@@ -1547,7 +1518,7 @@ def _plot_episode_sequence(
                 seg_start = frame
             prev_skill = skill
 
-        # Ultimo segmento
+        # Last segment
         if prev_skill is not None:
             color = colors(prev_skill % NUM_SKILL_CLASSES) if prev_skill != IGNORE_LABEL else "lightgrey"
             ax.barh(
@@ -1571,18 +1542,9 @@ def _plot_episode_sequence(
     plt.close(fig)
     log.info(f"  Sequence plot saved: {output_path}")
 
-# ═════════════════════════════════════════════════════════════════════════════
-# ENTRYPOINT
-# ═════════════════════════════════════════════════════════════════════════════
+# ── ENTRYPOINT ───────────────────────────────────────────────────────────    
 
 if __name__ == "__main__":
-    # mode = "test"  # cambia qui: "train", "train_val", "train_val_test", "test"
-    # @parser.wrap()
-    # def main(cfg: TrainPipelineConfig):
-    #     logging.info(f"Mode: {mode}")
-        # train(cfg, mode)
-
-    # DA PROVARE - FUNZIONANTE
     @parser.wrap()
     def main(cfg: PI0SkillTrainConfig):
         mode = cfg.mode
