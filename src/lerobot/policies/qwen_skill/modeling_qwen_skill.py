@@ -28,7 +28,7 @@ Batch keys expected
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass #, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -40,9 +40,7 @@ from PIL import Image
 log = logging.getLogger(__name__)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Utilities
-# ──────────────────────────────────────────────────────────────────────────────
+# ── UTILITIES ─────────────────────────────────────────────────────────────────
 
 def _tensor_to_pil(img: torch.Tensor) -> Image.Image:
     """
@@ -71,9 +69,7 @@ def _tensor_to_pil(img: torch.Tensor) -> Image.Image:
     return Image.fromarray(arr)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Attention pooling  
-# ──────────────────────────────────────────────────────────────────────────────
+# ── ATTENTION POOLING ─────────────────────────────────────────────────────────
 
 class AttentionPooling(nn.Module):
     """
@@ -104,9 +100,7 @@ class AttentionPooling(nn.Module):
         return torch.bmm(weights, x).squeeze(1)                   # (B, D)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────────────────────────────────────
+# ── CONFIG ────────────────────────────────────────────────────────────────────
 
 @dataclass
 class QwenSkillClassifierConfig:
@@ -140,9 +134,7 @@ class QwenSkillClassifierConfig:
     classifier_hidden_2:  int   = 512
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Model
-# ──────────────────────────────────────────────────────────────────────────────
+# ── MODEL ─────────────────────────────────────────────────────────────────────
 
 class QwenSkillClassifier(nn.Module):
     """
@@ -243,10 +235,29 @@ class QwenSkillClassifier(nn.Module):
         return None
 
     def _log_parameters(self) -> None:
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        frozen    = sum(p.numel() for p in self.parameters() if not p.requires_grad)
-        log.info(f"Trainable parameters : {trainable:,}")
-        log.info(f"Frozen parameters    : {frozen:,}")
+
+        trainable = [
+            (name, p.numel())
+            for name, p in self.named_parameters()
+            if p.requires_grad
+        ]
+
+        frozen = [
+            (name, p.numel())
+            for name, p in self.named_parameters()
+            if not p.requires_grad
+        ]
+
+        log.info(f"Trainable parameters ({len(trainable)}):")
+        for name, numel in trainable:
+            log.info(f"  {name:60s} {numel:>10,}")
+
+        log.info(
+            f"Total trainable: {sum(n for _, n in trainable):,}"
+        )
+        log.info(
+            f"Total frozen:    {sum(n for _, n in frozen):,}"
+        )
 
     # ── train() override ──────────────────────────────────────────────────────
 

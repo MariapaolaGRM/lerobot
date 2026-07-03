@@ -17,7 +17,7 @@ Usage:
 import os
 os.environ["LEROBOT_VIDEO_TIMESTAMP_TOLERANCE_S"] = "0.1"  # 10x la default
 
-import argparse
+#import argparse
 import json
 import logging
 import time
@@ -54,9 +54,9 @@ from lerobot.common.train_utils import (
 )
 
 # PI0 imports
-import lerobot
+#import lerobot
 
-from policies.qwen_skill.modeling_qwen_skill import (
+from modeling_qwen_skill import (
     QwenSkillClassifier,
     QwenSkillClassifierConfig,
 )
@@ -91,9 +91,17 @@ class SkillTrainConfig(TrainPipelineConfig):
     test_num_batches: int | None = None
     inference_episodes: list[int] | None = None
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SKILL VOCABULARY
-# ═════════════════════════════════════════════════════════════════════════════
+    model_name: str = "Qwen/Qwen3-VL-8B-Instruct"
+    classifier_hidden_1: int = 1024
+    classifier_hidden_2: int = 512
+    task_key: str = "task"
+    image_keys: tuple[str, ...] = (
+        "observation.images.rgb.head",
+        "observation.images.rgb.left_wrist",
+        "observation.images.rgb.right_wrist",
+    )
+
+# ── SKILL VOCABULARY ───────────────────────────────────────────────────────────
 
 SKILL_REGISTRY: dict[int, tuple[int, str]] = {
     # skill_id: (class_index, name)
@@ -114,9 +122,7 @@ IGNORE_LABEL = -100
 
 CLASS_NAMES        = [CLASS_TO_SKILL_NAME[i] for i in range(NUM_SKILL_CLASSES)]
 
-# ═════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
+# ── HELPERS ───────────────────────────────────────────────────────────────────
 
 def move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     batch = {
@@ -156,9 +162,7 @@ def unpack_policy_output(output: Any) -> tuple[torch.Tensor, torch.Tensor | None
     )
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# ANNOTATION LOADER
-# ═════════════════════════════════════════════════════════════════════════════
+# ── ANNOTATION LOADER ──────────────────────────────────────────────────────────
 
 def load_skill_annotation(annotation_path: Path) -> np.ndarray | None:
     """Load an episode annotation JSON and return frame-wise skill labels."""
@@ -187,9 +191,7 @@ def load_skill_annotation(annotation_path: Path) -> np.ndarray | None:
     return labels
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# DATASET WRAPPER
-# ═════════════════════════════════════════════════════════════════════════════
+# ── DATASET WRAPPER ────────────────────────────────────────────────────────────
 
 class SkillLabeledDataset(Dataset):
     """
@@ -267,9 +269,7 @@ class SkillLabeledDataset(Dataset):
         return sample
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# SPLIT HELPERS
-# ═════════════════════════════════════════════════════════════════════════════
+# ── SPLIT HELPERS ──────────────────────────────────────────────────────────────
 
 def create_episode_splits(
     num_episodes: int,
@@ -328,9 +328,7 @@ def create_episode_splits(
     return train_eps, val_eps, test_eps
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# METRICS
-# ═════════════════════════════════════════════════════════════════════════════
+# ── METRICS ───────────────────────────────────────────────────────────────────
 
 def compute_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
     valid_mask = labels != IGNORE_LABEL
@@ -361,7 +359,7 @@ def compute_per_class_accuracy(
 
     return per_class
 
-# ── Confusion matrix plot ────────────────────────────────────────────────────
+# ── CONFUSION MATRIX PLOT ─────────────────────────────────────────────────────
 
 def plot_confusion_matrix(cm: np.ndarray, class_names: list[str], output_path: Path):
     fig, ax = plt.subplots(figsize=(10, 8))
@@ -373,9 +371,7 @@ def plot_confusion_matrix(cm: np.ndarray, class_names: list[str], output_path: P
     plt.close(fig)
     log.info(f"Confusion matrix saved: {output_path}")
 
-# ═════════════════════════════════════════════════════════════════════════════
-# TRAINING STEP
-# ═════════════════════════════════════════════════════════════════════════════
+# ── TRAINING STEP ──────────────────────────────────────────────────────────────
 
 def training_step(
     cfg,
@@ -443,9 +439,7 @@ def training_step(
     }
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# VALIDATION
-# ═════════════════════════════════════════════════════════════════════════════
+# ── VALIDATION ────────────────────────────────────────────────────────────────
 
 @torch.no_grad() # disabilita calcolo dei gradienti
 def validate(
@@ -503,9 +497,29 @@ def validate(
         **{f"val/acc_{name}": acc for name, acc in per_class.items()},
     }
 
-# ═════════════════════════════════════════════════════════════════════════════
-# BUILD
-# ═════════════════════════════════════════════════════════════════════════════
+# ── BUILD ─────────────────────────────────────────────────────────────────────
+def _build_policy(cfg, device, features_meta):
+    logging.info("Loading Qwen policy...")
+    input_features = {
+        key: PolicyFeature(type=FeatureType.VISUAL, shape=tuple(feat["shape"]))
+        for key, feat in features_meta.items()
+        if key.startswith("observation.images")
+    }
+    logging.info(f"input_features: {list(input_features.keys())}")
+
+    policy_cfg = QwenSkillClassifierConfig(
+        num_skill_classes=NUM_SKILL_CLASSES,
+        model_name=cfg.model_name,
+        image_keys=tuple(input_features.keys()),
+        task_key=cfg.task_key,
+        classifier_hidden_1=cfg.classifier_hidden_1,
+        classifier_hidden_2=cfg.classifier_hidden_2,
+        device=str(device),
+    )
+    policy = QwenSkillClassifier(policy_cfg)
+    policy.load()
+    return policy.to(device)
+
 def build_everything(cfg, device):
      # ── Dataset ───────────────────────────────────────────────────────────
     logging.info("Loading dataset...")
@@ -589,50 +603,52 @@ def build_everything(cfg, device):
 
 
     # ── Policy ────────────────────────────────────────────────────────────
-    logging.info("Loading Qwen policy...")
+    # logging.info("Loading Qwen policy...")
 
-    input_features: dict = {}
-    features_meta = train_raw.meta.features  # dict chiave → {dtype, shape, ...}
-    for key, feat in features_meta.items():
-        if key.startswith("observation.images"):
-            # Le immagini hanno shape (C, H, W)
-            shape = tuple(feat["shape"])  # es. (3, 480, 640)
-            input_features[key] = PolicyFeature(type=FeatureType.VISUAL, shape=shape)
-        # elif cfg.policy.use_state and key == "observation.state":
-        #     #shape = tuple(feat["shape"])
-        #     input_features[key] = PolicyFeature(type=FeatureType.STATE, shape=(28,))
+    # input_features: dict = {}
+    # features_meta = train_raw.meta.features  # dict chiave → {dtype, shape, ...}
+    # for key, feat in features_meta.items():
+    #     if key.startswith("observation.images"):
+    #         # Le immagini hanno shape (C, H, W)
+    #         shape = tuple(feat["shape"])  # es. (3, 480, 640)
+    #         input_features[key] = PolicyFeature(type=FeatureType.VISUAL, shape=shape)
+       
 
-    output_features: dict = {}
-    if "action" in features_meta:
-        shape = tuple(features_meta["action"]["shape"])
-        output_features["action"] = PolicyFeature(type=FeatureType.ACTION, shape=shape)
+    # output_features: dict = {}
+    # if "action" in features_meta:
+    #     shape = tuple(features_meta["action"]["shape"])
+    #     output_features["action"] = PolicyFeature(type=FeatureType.ACTION, shape=shape)
 
-    logging.info(f"input_features: {list(input_features.keys())}")
+    # logging.info(f"input_features: {list(input_features.keys())}")
 
-    #base_policy_cfg = QwenSkillClassifierConfig()
-    policy_cfg = QwenSkillClassifierConfig(
-        num_skill_classes=NUM_SKILL_CLASSES,
-        model_name=getattr(cfg.policy, "model_name", "Qwen/Qwen3-VL-8B-Instruct"),
-        image_keys=tuple(input_features.keys()),  # se vuoi derivarle dal dataset
-        device=str(device),
-    )
+    # #base_policy_cfg = QwenSkillClassifierConfig()
+    # policy_cfg = QwenSkillClassifierConfig(
+    #     num_skill_classes=NUM_SKILL_CLASSES,
+    #     model_name=cfg.model_name,
+    #     image_keys=tuple(cfg.image_keys),
+    #     task_key=cfg.task_key,
+    #     classifier_hidden_1=cfg.classifier_hidden_1,
+    #     classifier_hidden_2=cfg.classifier_hidden_2,
+    #     device=str(device),
+    # )
 
-    # policy = QwenSkillClassifier.from_pretrained(
-    #     cfg.policy.pretrained_path, #cfg.policy.pretrained_model_name_or_path,
-    #     config=policy_cfg,
-    #     strict=False,
-    #     ignore_mismatched_sizes=True,
-    #     torch_dtype=torch.bfloat16,
-    #     #torch_dtype=torch.float16, # pesi caricati in fp16 
-    # ).to(device)
-    policy = QwenSkillClassifier(policy_cfg)
-    policy.load()
-    policy = policy.to(device)
+    # # policy = QwenSkillClassifier.from_pretrained(
+    # #     cfg.policy.pretrained_path, #cfg.policy.pretrained_model_name_or_path,
+    # #     config=policy_cfg,
+    # #     strict=False,
+    # #     ignore_mismatched_sizes=True,
+    # #     torch_dtype=torch.bfloat16,
+    # #     #torch_dtype=torch.float16, # pesi caricati in fp16 
+    # # ).to(device)
+    # policy = QwenSkillClassifier(policy_cfg)
+    # policy.load()
+    # policy = policy.to(device)
 
     # preprocessor, postprocessor = make_pi0_pre_post_processors(
     #     config=policy_cfg,
     #     dataset_stats=train_raw.meta.stats,
     # )
+    policy = _build_policy(cfg, device, train_raw.meta.features)
 
     if device.type == "cuda":
         allocated = torch.cuda.memory_allocated() / 1e9
@@ -640,15 +656,15 @@ def build_everything(cfg, device):
         print(f"GPU dopo caricamento modello: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
         #raise SystemExit("DEBUG STOP")
 
-    trainable = [(n, p.numel()) for n, p in policy.named_parameters() if p.requires_grad]
-    frozen = [(n, p.numel()) for n, p in policy.named_parameters() if not p.requires_grad]
-    logging.info(f"Trainable parameters ({len(trainable)}):")
-    for name, numel in trainable:
-        logging.info(f"  {name:60s} {numel:>10,}")
-    logging.info(
-        f"Total trainable: {sum(n for _, n in trainable):,} | "
-        f"Total frozen:    {sum(n for _, n in frozen):,}"
-    )
+    # trainable = [(n, p.numel()) for n, p in policy.named_parameters() if p.requires_grad]
+    # frozen = [(n, p.numel()) for n, p in policy.named_parameters() if not p.requires_grad]
+    # logging.info(f"Trainable parameters ({len(trainable)}):")
+    # for name, numel in trainable:
+    #     logging.info(f"  {name:60s} {numel:>10,}")
+    # logging.info(
+    #     f"Total trainable: {sum(n for _, n in trainable):,} | "
+    #     f"Total frozen:    {sum(n for _, n in frozen):,}"
+    # )
 
     return (
         policy,
@@ -694,25 +710,25 @@ def build_for_inference(cfg, device, episodes=None):
     # ... stesso codice di build_everything per policy e preprocessor ...
 
     # ── Policy ────────────────────────────────────────────────────────────
-    logging.info("Loading Qwen policy...")
+    # logging.info("Loading Qwen policy...")
 
-    input_features: dict = {}
-    features_meta = raw_dataset.meta.features  # dict chiave → {dtype, shape, ...}
-    for key, feat in features_meta.items():
-        if key.startswith("observation.images"):
-            # Le immagini hanno shape (C, H, W)
-            shape = tuple(feat["shape"])  # es. (3, 480, 640)
-            input_features[key] = PolicyFeature(type=FeatureType.VISUAL, shape=shape)
-        # elif cfg.policy.use_state and key == "observation.state":
-        #     #shape = tuple(feat["shape"])
-        #     input_features[key] = PolicyFeature(type=FeatureType.STATE, shape=(28,))
+    # input_features: dict = {}
+    # features_meta = raw_dataset.meta.features  # dict chiave → {dtype, shape, ...}
+    # for key, feat in features_meta.items():
+    #     if key.startswith("observation.images"):
+    #         # Le immagini hanno shape (C, H, W)
+    #         shape = tuple(feat["shape"])  # es. (3, 480, 640)
+    #         input_features[key] = PolicyFeature(type=FeatureType.VISUAL, shape=shape)
+    #     # elif cfg.policy.use_state and key == "observation.state":
+    #     #     #shape = tuple(feat["shape"])
+    #     #     input_features[key] = PolicyFeature(type=FeatureType.STATE, shape=(28,))
 
-    output_features: dict = {}
-    if "action" in features_meta:
-        shape = tuple(features_meta["action"]["shape"])
-        output_features["action"] = PolicyFeature(type=FeatureType.ACTION, shape=shape)
+    # output_features: dict = {}
+    # if "action" in features_meta:
+    #     shape = tuple(features_meta["action"]["shape"])
+    #     output_features["action"] = PolicyFeature(type=FeatureType.ACTION, shape=shape)
 
-    logging.info(f"input_features: {list(input_features.keys())}")
+    # logging.info(f"input_features: {list(input_features.keys())}")
 
     #base_policy_cfg = QwenSkillClassifierConfig()
     # policy_cfg = QwenSkillClassifierConfig(
@@ -726,12 +742,12 @@ def build_for_inference(cfg, device, episodes=None):
     #         and hasattr(base_policy_cfg, k)
     #     },
     # )
-    policy_cfg = QwenSkillClassifierConfig(
-        num_skill_classes=NUM_SKILL_CLASSES,
-        model_name=getattr(cfg.policy, "model_name", "Qwen/Qwen3-VL-8B-Instruct"),
-        image_keys=tuple(input_features.keys()),  # se vuoi derivarle dal dataset
-        device=str(device),
-    )
+    # policy_cfg = QwenSkillClassifierConfig(
+    #     num_skill_classes=NUM_SKILL_CLASSES,
+    #     model_name=getattr(cfg.policy, "model_name", "Qwen/Qwen3-VL-8B-Instruct"),
+    #     image_keys=tuple(input_features.keys()),  # se vuoi derivarle dal dataset
+    #     device=str(device),
+    # )
 
     # policy = QwenSkillClassifier.from_pretrained(
     #     cfg.policy.pretrained_path, #cfg.policy.pretrained_model_name_or_path,
@@ -741,14 +757,16 @@ def build_for_inference(cfg, device, episodes=None):
     #     torch_dtype=torch.bfloat16,
     #     #torch_dtype=torch.float16, # pesi caricati in fp16 
     # ).to(device)
-    policy = QwenSkillClassifier(policy_cfg)
-    policy.load()
-    policy = policy.to(device)
+    # policy = QwenSkillClassifier(policy_cfg)
+    # policy.load()
+    # policy = policy.to(device)
 
     # preprocessor, postprocessor = make_pi0_pre_post_processors(
     #     config=policy_cfg,
     #     dataset_stats=raw_dataset.meta.stats, # VERIFICARE - va bene solo se le statistiche di raw sono le stesse usate per il training (stesso dataset)
     # )
+    policy = _build_policy(cfg, device, raw_dataset.meta.features)
+
 
     if device.type == "cuda":
         allocated = torch.cuda.memory_allocated() / 1e9
@@ -761,11 +779,9 @@ def build_for_inference(cfg, device, episodes=None):
         loader
     )
 
-# ═════════════════════════════════════════════════════════════════════════════
-# MAIN LOOP
-# ═════════════════════════════════════════════════════════════════════════════
+# ── MAIN LOOP ─────────────────────────────────────────────────────────────────
 
-# ── Train and val ────────────────────────────────────────────────────────
+# ── TRAIN AND VAL ──────────────────────────────────────────────────────────────
 def train(cfg, mode: str = "train_val") -> None:
     """Main training loop.
 
@@ -1048,7 +1064,7 @@ def train(cfg, mode: str = "train_val") -> None:
     logging.info("Training complete.")
 
 
-# ── Test ────────────────────────────────────────────────────────
+# ── TEST ──────────────────────────────────────────────────────────────────────
 @torch.no_grad()
 def run_test(cfg, num_batches: int | None):
     set_seed(cfg.seed)
@@ -1172,9 +1188,7 @@ def run_test(cfg, num_batches: int | None):
 
     return summary
 
-# ═════════════════════════════════════════════════════════════════════════════
-# INFERENCE — segmentazione automatica episodi senza label
-# ═════════════════════════════════════════════════════════════════════════════
+# ── INFERENCE ─────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def run_inference(cfg, num_batches: int | None = None) -> None:
@@ -1481,7 +1495,7 @@ def run_inference(cfg, num_batches: int | None = None) -> None:
         log.info(f"\nInference completata. Risultati in: {output_dir}")
 
 
-# ── Helpers per inference ─────────────────────────────────────────────────────
+# ── INFERENCE HELPERS ─────────────────────────────────────────────────────────
 def smooth_predictions(preds, window):
     """
     Finestra centrata: guarda window//2 frame prima
@@ -1599,9 +1613,7 @@ def _plot_episode_sequence(
     plt.close(fig)
     log.info(f"  Sequence plot saved: {output_path}")
 
-# ═════════════════════════════════════════════════════════════════════════════
-# ENTRYPOINT
-# ═════════════════════════════════════════════════════════════════════════════
+# ── ENTRYPOINT ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
 
